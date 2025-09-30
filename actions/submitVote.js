@@ -25,7 +25,7 @@ module.exports = async (eventObj, queue) => {
     return channel.send('You already voted. Type !votestatus to see the tally.')
   }
 
-  // accept "!r" or "!c" (ignore old hyphen format)
+  // accept "!r" or "!c"
   let choice = null
   if (raw.startsWith('!r')) choice = 'r'
   if (raw.startsWith('!c')) choice = 'c'

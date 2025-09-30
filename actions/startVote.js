@@ -102,7 +102,6 @@ module.exports = async (eventObj, queue) => {
     queue.votingInProgress = false
     queue._voteTimeout = null
     channel.send('No decision reached in time. **Lobby auto-disbanded.** Players may queue again.')
-    // full reset: let queue manager remove/clear this queue
     const { deletePlayerQueue } = require('../utils/managePlayerQueues')
     deletePlayerQueue(queue.lobby.id)
   }, VOTE_TIMEOUT_MS)

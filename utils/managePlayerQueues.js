@@ -71,7 +71,8 @@ function createQueue(guildId) {
       brand: BRAND,
       region: REGION,
       series: SERIES,
-      password: randomstring.generate({ length: 3 }).toLowerCase(),
+      // digits-only code avoids accidental words
+      password: randomstring.generate({ length: 4, charset: '23456789' }),
     },
 
     players: [],
@@ -137,7 +138,7 @@ function registerActiveMatch(queue, teamAIds, teamBIds) {
   queue.votingInProgress = false
   queue.creatingTeamsInProgress = false
 
-  // Cancel auto-disband timer; match is in progress
+  // Cancel auto-disband + vote timers; match is in progress
   if (queue.autoDisbandTimer) {
     clearTimeout(queue.autoDisbandTimer)
     queue.autoDisbandTimer = null
@@ -195,7 +196,7 @@ function deletePlayerQueue(lobbyId) {
   }
 }
 
-// IMPORTANT: fully clear players & indices so users can requeue after remake
+// Fully clear players & indices so users can requeue after remake
 function resetPlayerQueue(lobbyId) {
   for (const [, state] of guildStates) {
     const idx = state.queues.findIndex(q => q.lobby.id === lobbyId)

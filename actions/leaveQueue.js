@@ -14,7 +14,7 @@ module.exports = (eventObj, queue) => {
 
   const size = Object.keys(queue.playerIdsIndexed || {}).length
 
-  // Once lobby hits the required size (and voting/creation is underway), block leaving
+  // Once lobby hits required size and is in progress, block leaving
   if (size >= REQUIRED_PLAYERS && (queue.votingInProgress || queue.creatingTeamsInProgress || queue.readyToJoin)) {
     return channel.send(
       `The lobby is full/in progress. You cannot leave now — use **${commandToString.remake || '!remake'}** to vote to cancel.`
