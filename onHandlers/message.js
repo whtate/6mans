@@ -1,0 +1,357 @@
+// onHandlers/message.js
+
+// Actions (direct imports to avoid circular dependency)
+const enterQueue      = require('../actions/enterQueue')
+const leaveQueue      = require('../actions/leaveQueue')
+const getQueueStatus  = require('../actions/getQueueStatus')
+const getVoteStatus   = require('../actions/getVoteStatus')
+const submitVote      = require('../actions/submitVote')
+const sendCommandList = require('../actions/sendCommandList')
+const kickPlayer      = require('../actions/kickPlayer')
+
+// DB helpers
+const {
+  getStats, upsertPlayer, getLeaderboard,
+  recordResult, getLobbyHistory, getUserHistory, getLastMatches
+} = require('../db')
+
+// Queue manager
+const {
+  determinePlayerQueue,
+  findActiveMatchQueueByPlayer,
+  clearActiveMatch,
+  registerRemakeVote,
+  requiredRemakeVotes,
+  resetPlayerQueue,
+} = require('../utils/managePlayerQueues')
+
+// Commands map
+const { commandToString, validCommandCheck } = require('../utils/commands')
+
+// Env
+const { NODE_ENV, channelName, debugLogs } = process.env
+
+const REQUIRED_PLAYERS =
+  Number.isFinite(parseInt(process.env.REQUIRED_PLAYERS, 10))
+    ? parseInt(process.env.REQUIRED_PLAYERS, 10)
+    : 6
+
+const BRAND = process.env.lobbyName || 'in-house 6mans'
+
+// ---------- helpers ----------
+
+function toIds(arr) {
+  return (arr || []).map(p => (typeof p === 'string' ? p : p?.id)).filter(Boolean)
+}
+
+function getTeamIdsFromQueue(queue) {
+  if (Array.isArray(queue?.teamA) && Array.isArray(queue?.teamB)) {
+    return { ok: true, teamAIds: toIds(queue.teamA), teamBIds: toIds(queue.teamB), labels: { A: 'A', B: 'B' } }
+  }
+  if (queue?.teams?.blue?.players && queue?.teams?.orange?.players) {
+    return { ok: true, teamAIds: toIds(queue.teams.blue.players), teamBIds: toIds(queue.teams.orange.players), labels: { A: 'blue', B: 'orange' } }
+  }
+  if (Array.isArray(queue?.teams?.A) && Array.isArray(queue?.teams?.B)) {
+    return { ok: true, teamAIds: toIds(queue.teams.A), teamBIds: toIds(queue.teams.B), labels: { A: 'A', B: 'B' } }
+  }
+  if (queue?.activeMatch) {
+    return { ok: true, teamAIds: toIds(queue.activeMatch.teamAIds), teamBIds: toIds(queue.activeMatch.teamBIds), labels: { A: 'A', B: 'B' } }
+  }
+  return { ok: false }
+}
+
+function fmtUser(id, username) {
+  const isSnowflake = /^\d+$/.test(id)
+  return isSnowflake ? `<@${id}>${username ? ` (${username})` : ''}` : (username || String(id))
+}
+
+function fmtTeam(list) {
+  return list.map(u => `- ${fmtUser(u, null)}`).join('\n')
+}
+
+// ---------- handler ----------
+
+module.exports = async (eventObj, botUser = { id: undefined }) => {
+  const msg = eventObj.content.trim()
+  const msgLower = msg.toLowerCase()
+  const type = eventObj.channel.type
+  const isCommand = msgLower.startsWith('!')
+  const authorId = eventObj.author.id
+  const guildId = eventObj.guild?.id
+  const channel = eventObj.channel
+
+  const commonLogCheck = debugLogs === 'true' && authorId !== botUser.id
+
+  if (channelName && channel.name !== channelName) {
+    if (commonLogCheck) {
+      console.log('The user is typing on a different channel, disregarding message')
+      console.log(channel.name + ' !== ' + channelName)
+    }
+    return
+  }
+
+  if (!isCommand) {
+    if (commonLogCheck) console.log('The user is not typing a 6mans command, disregarding message')
+    return
+  }
+
+  if (NODE_ENV !== 'development' && type === 'dm') {
+    if (commonLogCheck) console.log('The user is direct messaging the bot, disregarding message')
+    return
+  }
+
+  if (authorId === botUser.id) return
+
+  // parse command
+  const [rawCommand, ...rest] = msgLower.split(/\s+/)
+  const command = rawCommand
+  const playerId = eventObj.author.id
+
+  // Place user into a queue for join-related commands; else we may use active-match lookup.
+  let queue = determinePlayerQueue(playerId, command, guildId)
+
+  // Commands that do NOT require queue membership
+  const nonQueueCommands = new Set([
+    commandToString.stats,
+    '!leaderboard', commandToString.leaderboard, // both accepted
+    commandToString.help,
+    commandToString.report,
+    commandToString.lobbyhistory, '!lh', '!lobby', '!lobby-history',
+    commandToString.playerhistory,
+    commandToString.lastmatch, '!lastmatch', '!last-match',
+    commandToString.remake,
+  ])
+
+  if (isCommand && !queue && validCommandCheck[command] && !nonQueueCommands.has(command)) {
+    channel.send(`You have not entered the queue <@${playerId}>. Type ${commandToString.queue} to join!`)
+    return
+  }
+
+  // ------------- switch -------------
+
+  switch (command) {
+    // queue flow
+    case commandToString.queue:
+    case '!queue':
+      enterQueue(eventObj, queue)
+      break
+
+    case commandToString.leave:
+      leaveQueue(eventObj, queue)
+      break
+
+    case commandToString.status:
+      getQueueStatus(eventObj, queue)
+      break
+
+    case commandToString.votestatus:
+      getVoteStatus(eventObj, queue)
+      break
+
+    case commandToString.r:
+    case commandToString.c:
+      submitVote(eventObj, queue)
+      break
+
+    case commandToString.help:
+      sendCommandList(eventObj)
+      break
+
+    case commandToString.kick:
+      kickPlayer(eventObj, queue)
+      break
+
+    // stats
+    case commandToString.stats: {
+      const target = eventObj.mentions.users.first() || eventObj.author
+      await upsertPlayer({ guildId, userId: target.id, username: target.username })
+      const s = await getStats({ guildId, userId: target.id })
+      if (!s || !s.life) return channel.send(`No stats yet for <@${target.id}>`)
+      const monthW = s.month.wins || 0
+      const monthL = s.month.losses || 0
+      const monthD = s.month.mmr_delta || 0
+      const life = s.life
+      return channel.send(
+        `**${life.username}**\n` +
+        `**This month:** W **${monthW}** / L **${monthL}** | ΔMMR **${monthD >= 0 ? '+' : ''}${monthD}**\n` +
+        `**Lifetime:**  MMR **${life.mmr}** | W **${life.wins}** / L **${life.losses}**`
+      )
+    }
+
+    // leaderboard
+    case commandToString.leaderboard:
+    case '!leaderboard': {
+      const rows = await getLeaderboard({ guildId, limit: 10 })
+      if (!rows.length) return channel.send('No games recorded yet.')
+      const header = `**Monthly Leaderboard (Top ${rows.length})**\n\`\`\`\n#  W   L  ΔMMR  NAME\n-----------------------------`
+      const lines = rows.map((r, i) => {
+        const rank = String(i + 1).padStart(2, ' ')
+        const w    = String(r.month_wins || 0).padStart(3, ' ')
+        const l    = String(r.month_losses || 0).padStart(3, ' ')
+        const d    = String((r.month_mmr_delta || 0)).padStart(5, ' ')
+        return `${rank} ${w} ${l} ${d}  ${r.username}`
+      })
+      return channel.send([header, ...lines, '```'].join('\n'))
+    }
+
+    // report (still !report a|b)
+    case commandToString.report: {
+      const arg = rest[0]?.toLowerCase()
+      if (!['a','b'].includes(arg)) return channel.send('Usage: !report a | !report b')
+      const winner = arg.toUpperCase()
+
+      if (!queue) queue = findActiveMatchQueueByPlayer(guildId, authorId)
+      if (!queue) return channel.send('No active match found to report for.')
+
+      const extracted = getTeamIdsFromQueue(queue)
+      if (!extracted.ok) return channel.send('Could not determine teams. Make sure teams are created.')
+      const { teamAIds, teamBIds, labels } = extracted
+
+      const perTeam = Math.floor(REQUIRED_PLAYERS / 2)
+      if (teamAIds.length !== perTeam || teamBIds.length !== perTeam) {
+        return channel.send(`Teams not complete yet. Expected ${perTeam} per team.`)
+      }
+
+      const isParticipant = teamAIds.includes(authorId) || teamBIds.includes(authorId)
+      if (!isParticipant) return channel.send('Only players in this match can report the result.')
+
+      try {
+        const { matchId, deltaA, deltaB } = await recordResult({
+          guildId,
+          teamAIds,
+          teamBIds,
+          winner,
+          reporterUserId: authorId,
+          lobbyName: queue?.lobby?.name || null,
+          lobbyRegion: queue?.lobby?.region || null,
+          lobbySeries: queue?.lobby?.series || null,
+        })
+
+        clearActiveMatch(queue)
+        resetPlayerQueue(queue.lobby.id)
+
+        return channel.send(
+          `**Match #${matchId} recorded**\n` +
+          `Winner: Team ${winner} (${labels ? labels[winner] : winner})\n` +
+          `Team A ΔMMR ${deltaA >= 0 ? '+' : ''}${deltaA}, Team B ΔMMR ${deltaB >= 0 ? '+' : ''}${deltaB}\n` +
+          `Lobby: ${queue?.lobby?.name || 'n/a'}\n` +
+          `Reported by: <@${authorId}>\n\n` +
+          `Lobby reset. Players can queue again immediately.`
+        )
+      } catch (e) {
+        console.error('report error', e)
+        return channel.send('Failed to record result. Check logs.')
+      }
+    }
+
+    // remake
+    case commandToString.remake: {
+      if (!queue) queue = findActiveMatchQueueByPlayer(guildId, authorId)
+      if (!queue) return channel.send('No active lobby found to remake.')
+
+      const allIds = queue?.activeMatch
+        ? [...queue.activeMatch.teamAIds, ...queue.activeMatch.teamBIds]
+        : Object.keys(queue.playerIdsIndexed)
+
+      if (!allIds.includes(authorId)) return channel.send('Only players in this lobby can vote to remake.')
+
+      const { counted, total } = registerRemakeVote(queue, authorId)
+      const need = requiredRemakeVotes()
+      if (!counted) return channel.send(`You already voted to remake. Current votes: **${total}/${need}**.`)
+
+      if (total >= need) {
+        clearActiveMatch(queue)
+        resetPlayerQueue(queue.lobby.id)
+        return channel.send(`**Remake passed.** Lobby reset. Players can queue again now.`)
+      }
+      return channel.send(`Remake vote recorded. Current votes: **${total}/${need}**.`)
+    }
+
+    // LOBBY HISTORY (no hyphen) — auto mode
+    case commandToString.lobbyhistory:
+    case '!lh':
+    case '!lobby':
+    case '!lobby-history': {
+      // If an argument is a number, treat it as "Lobby #N" with brand
+      const rawArg = msg.slice(command.length).trim() // preserve case & spaces
+      let name = rawArg || ''
+
+      if (!name) {
+        // Auto: use current queue's lobby name if available; else use most recent match's lobby
+        if (queue?.lobby?.name) {
+          name = queue.lobby.name
+        } else {
+          const latest = await getLastMatches({ guildId, limit: 1 })
+          if (latest.length && latest[0].lobby_name) {
+            name = latest[0].lobby_name
+          } else {
+            // fallback: no filter (will show recent across all lobbies)
+            name = ''
+          }
+        }
+      } else {
+        // Normalize numbers → "Brand — Lobby #N"
+        const num = name.match(/^\s*(\d+)\s*$/)?.[1]
+        if (num) name = `${BRAND} — Lobby #${num}`
+      }
+
+      const rows = await getLobbyHistory({ guildId, lobbyName: name || null, limit: 10 })
+      if (!rows.length) {
+        return channel.send(name ? `No matches found for lobby **${name}**.` : 'No matches found.')
+      }
+
+      const header =
+        `**Recent Matches${name ? ` — ${name}` : ''}**\n` +
+        '```' + '\n' +
+        'ID   W  LOBBY                         WHEN' + '\n' +
+        '--------------------------------------------------'
+      const lines = rows.map(r => {
+        const when = new Date(r.created_at).toLocaleString()
+        const lobby = (r.lobby_name || '-').padEnd(28)
+        return `${String(r.id).padEnd(4)} ${r.winner}  ${lobby} ${when}`
+      })
+      return channel.send([header, ...lines, '```'].join('\n'))
+    }
+
+    // PLAYER HISTORY (kept as !history)
+    case commandToString.playerhistory: {
+      const target = eventObj.mentions.users.first() || eventObj.author
+      const rows = await getUserHistory({ guildId, userId: target.id, limit: 10 })
+      if (!rows.length) return channel.send(`No matches found for <@${target.id}>.`)
+
+      const header =
+        `**Recent Matches for ${target.username}**\n` +
+        '```' + '\n' +
+        'ID   W/L  ΔMMR  LOBBY                         WHEN' + '\n' +
+        '--------------------------------------------------------'
+      const lines = rows.map(r => {
+        const when = new Date(r.created_at).toLocaleString()
+        const wl = r.user_win ? 'W' : 'L'
+        const delta = (r.user_delta || 0)
+        const deltaStr = `${delta >= 0 ? '+' : ''}${delta}`.padStart(4)
+        const lobby = (r.lobby_name || '-').padEnd(28)
+        return `${String(r.id).padEnd(4)} ${wl}   ${deltaStr}  ${lobby} ${when}`
+      })
+      return channel.send([header, ...lines, '```'].join('\n'))
+    }
+
+    // LAST MATCH
+    case commandToString.lastmatch:
+    case '!lastmatch':
+    case '!last-match': {
+      const rows = await getLastMatches({ guildId, limit: 1 })
+      if (!rows.length) return channel.send('No matches recorded yet.')
+      const m = rows[0]
+      const when = new Date(m.created_at).toLocaleString()
+      return channel.send(
+        `**Last Match #${m.id}** — ${when}\n` +
+        `Winner: Team ${m.winner}\n` +
+        `Lobby: ${m.lobby_name || 'n/a'}\n` +
+        `Reported by: <@${m.reporter_user_id}>`
+      )
+    }
+
+    default:
+      return
+  }
+}
