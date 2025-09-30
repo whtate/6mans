@@ -3,58 +3,78 @@ module.exports = async (eventObj, queue) => {
   const { lobby, teams } = queue
   const channel = eventObj.channel
   const guild = eventObj.guild
-  const parentChannel = guild.channels.find(
-    channelObj => channelObj.name === process.env.categoryName && channelObj.type === 'category'
-  )
-  const everyoneRole = guild.roles.find(roleObj => roleObj.name === '@everyone')
 
-  console.log('categoryName', process.env.categoryName)
-  console.log('parentChannel', parentChannel && parentChannel.id)
-  console.log('everyoneRole', everyoneRole && everyoneRole.id)
-  console.log('blue team players', teams.blue.players)
-  console.log('orange team players', teams.orange.players)
-
-  if (!guild.available) {
-    return channel.send('I do not have the permissions to make channels.')
+  if (!guild || !guild.available) {
+    return channel.send('I do not have access to this guild right now.')
   }
 
+  // Find the category to put voice channels under
+  const parentChannel = guild.channels.find(
+    ch => ch.type === 'category' && ch.name === process.env.categoryName
+  )
+  if (!parentChannel) {
+    return channel.send(
+      `Category **${process.env.categoryName}** not found. Create it first (exact name), then try again.`
+    )
+  }
+
+  // @everyone role for default denies
+  const everyoneRole = guild.roles.find(r => r.name === '@everyone')
+  if (!everyoneRole) {
+    return channel.send('Could not find @everyone role. Check the bot permissions/roles.')
+  }
+
+  // Build v11-compatible permission overwrites
+  const blueOverwrites = [
+    {
+      id: everyoneRole.id,
+      type: 'role',
+      deny: ['CONNECT', 'SPEAK', 'CREATE_INSTANT_INVITE'],
+    },
+    ...teams.blue.players
+      .filter(p => p && p.id)
+      .map(p => ({
+        id: p.id,
+        type: 'member',
+        allow: ['CONNECT', 'SPEAK'],
+      })),
+  ]
+
+  const orangeOverwrites = [
+    {
+      id: everyoneRole.id,
+      type: 'role',
+      deny: ['CONNECT', 'SPEAK', 'CREATE_INSTANT_INVITE'],
+    },
+    ...teams.orange.players
+      .filter(p => p && p.id)
+      .map(p => ({
+        id: p.id,
+        type: 'member',
+        allow: ['CONNECT', 'SPEAK'],
+      })),
+  ]
+
+  // Create Blue voice channel
   const blueVoiceChannel = await guild.createChannel(`${lobby.name}-blue`, 'voice', {
-    parent: parentChannel && parentChannel.id,
+    parent: parentChannel.id,
     userLimit: 3,
-    permissionOverwrites: [
-      {
-        id: everyoneRole.id,
-        deny: ['CONNECT', 'SPEAK', 'CREATE_INSTANT_INVITE'],
-      },
-      ...teams.blue.players.map(playerObj => {
-        return {
-          id: playerObj.id,
-          allow: ['CONNECT', 'SPEAK'],
-        }
-      }),
-    ],
+    permissionOverwrites: blueOverwrites,
   })
 
+  // Create Orange voice channel
   const orangeVoiceChannel = await guild.createChannel(`${lobby.name}-orange`, 'voice', {
-    parent: parentChannel && parentChannel.id,
+    parent: parentChannel.id,
     userLimit: 3,
-    permissionOverwrites: [
-      {
-        id: everyoneRole.id,
-        deny: ['CONNECT', 'SPEAK', 'CREATE_INSTANT_INVITE'],
-      },
-      ...teams.orange.players.map(playerObj => {
-        return {
-          id: playerObj.id,
-          allow: ['CONNECT', 'SPEAK'],
-        }
-      }),
-    ],
+    permissionOverwrites: orangeOverwrites,
   })
 
-  console.log('blue voice channel is being set to', blueVoiceChannel.id)
-  console.log('orange voice channel is being set to', orangeVoiceChannel.id)
-
+  // Save IDs back to queue
   teams.blue.voiceChannelID = blueVoiceChannel.id
   teams.orange.voiceChannelID = orangeVoiceChannel.id
+
+  // Optional: confirm
+  channel.send(
+    `Voice channels created:\n• <#${blueVoiceChannel.id}>\n• <#${orangeVoiceChannel.id}>`
+  )
 }
