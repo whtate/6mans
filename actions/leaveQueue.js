@@ -1,22 +1,34 @@
-const { deletePlayerQueue } = require('../utils/managePlayerQueues')
-const playerNotInQueue = require('../utils/playerNotInQueue')
+// actions/leaveQueue.js
+const { commandToString } = require('../utils/commands')
+
+const REQUIRED_PLAYERS =
+  Number.isFinite(parseInt(process.env.REQUIRED_PLAYERS, 10))
+    ? parseInt(process.env.REQUIRED_PLAYERS, 10)
+    : 6
 
 module.exports = (eventObj, queue) => {
-  let { players, playerIdsIndexed, lobby } = queue
-  const channel = eventObj.channel
+  if (!queue) return eventObj.channel.send('You are not in a queue.')
+
+  const channel  = eventObj.channel
   const playerId = eventObj.author.id
-  const playerIndexInQueue = players.findIndex(playerObj => playerObj.id === playerId)
 
-  // Player is not in the queue
-  if (playerNotInQueue({ playerId, channel, queue })) return
+  const size = Object.keys(queue.playerIdsIndexed || {}).length
 
-  // Player is in the queue
-  players.splice(playerIndexInQueue, 1)
-  delete playerIdsIndexed[playerId]
+  // Once lobby hits the required size (and voting/creation is underway), block leaving
+  if (size >= REQUIRED_PLAYERS && (queue.votingInProgress || queue.creatingTeamsInProgress || queue.readyToJoin)) {
+    return channel.send(
+      `The lobby is full/in progress. You cannot leave now — use **${commandToString.remake || '!remake'}** to vote to cancel.`
+    )
+  }
+
+  if (!queue.playerIdsIndexed[playerId]) {
+    return channel.send('You are not in a queue.')
+  }
+
+  delete queue.playerIdsIndexed[playerId]
+  if (Array.isArray(queue.players)) {
+    queue.players = queue.players.filter(p => p.id !== playerId)
+  }
 
   channel.send(`You have left the queue <@${playerId}>`)
-
-  if (Object.keys(playerIdsIndexed).length === 0) {
-    deletePlayerQueue(lobby.id)
-  }
 }

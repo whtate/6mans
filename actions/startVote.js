@@ -8,11 +8,16 @@ const REQUIRED_PLAYERS =
     ? parseInt(process.env.REQUIRED_PLAYERS, 10)
     : 6
 
+const VOTE_TIMEOUT_MS =
+  Number.isFinite(parseInt(process.env.VOTE_TIMEOUT_MS, 10))
+    ? parseInt(process.env.VOTE_TIMEOUT_MS, 10)
+    : (4 * 60 * 1000) // default 4 minutes
+
 module.exports = async (eventObj, queue) => {
   const channel = eventObj.channel
   const { playerIdsIndexed, lobby } = queue
 
-  // DEV MODE: auto-pick captains & teams, then free players to re-queue while keeping an active match
+  // DEV MODE: auto-create teams for fast testing
   if (process.env.NODE_ENV === 'development') {
     const players = Array.isArray(queue.players) ? [...queue.players] : []
     if (players.length < REQUIRED_PLAYERS) {
@@ -20,7 +25,7 @@ module.exports = async (eventObj, queue) => {
       return
     }
 
-    // shuffle
+    // simple shuffle
     for (let i = players.length - 1; i > 0; i--) {
       const j = Math.floor(Math.random() * (i + 1))
       ;[players[i], players[j]] = [players[j], players[i]]
@@ -30,15 +35,12 @@ module.exports = async (eventObj, queue) => {
     const captainA = players[0]
     const captainB = players[1]
     const rest = players.slice(2)
-
-    const teamA = [captainA]
-    const teamB = [captainB]
+    const teamA = [captainA], teamB = [captainB]
     rest.forEach((p, idx) => (idx % 2 === 0 ? teamA.push(p) : teamB.push(p)))
 
     queue.teamA = teamA.map(p => ({ id: p.id, username: p.username }))
     queue.teamB = teamB.map(p => ({ id: p.id, username: p.username }))
 
-    // Mark as active match & free players from queue so they can re-queue
     registerActiveMatch(
       queue,
       queue.teamA.map(p => p.id),
@@ -54,10 +56,10 @@ module.exports = async (eventObj, queue) => {
         title: `Dev mode: Teams created for ${lobby?.name || 'Lobby'}`,
         description: `Captains & teams have been auto-selected for testing.`,
         fields: [
-          { name: 'Team A Captain', value: /^\d+$/.test(captainA.id) ? `<@${captainA.id}>` : captainA.username, inline: false },
-          { name: 'Team A Roster', value: listNoCaptain(queue.teamA), inline: false },
-          { name: 'Team B Captain', value: /^\d+$/.test(captainB.id) ? `<@${captainB.id}>` : captainB.username, inline: false },
-          { name: 'Team B Roster', value: listNoCaptain(queue.teamB), inline: false },
+          { name: 'Team A Captain', value: /^\d+$/.test(captainA.id) ? `<@${captainA.id}>` : captainA.username },
+          { name: 'Team A Roster', value: listNoCaptain(queue.teamA) },
+          { name: 'Team B Captain', value: /^\d+$/.test(captainB.id) ? `<@${captainB.id}>` : captainB.username },
+          { name: 'Team B Roster', value: listNoCaptain(queue.teamB) },
           { name: 'Next step', value: `Type **${commandToString.report || '!report'} a** or **${commandToString.report || '!report'} b** to record the result.` },
         ],
       },
@@ -65,20 +67,43 @@ module.exports = async (eventObj, queue) => {
     return
   }
 
-  // PRODUCTION: your existing vote-based flow
+  // PRODUCTION: vote-based flow with timeout
   queue.votingInProgress = true
+  queue.creatingTeamsInProgress = false
+  queue.votes = { r: 0, c: 0, playersWhoVoted: {} }
+
+  // clear previous timer
+  if (queue._voteTimeout) {
+    clearTimeout(queue._voteTimeout)
+    queue._voteTimeout = null
+  }
+
+  const totalPlayers = Object.keys(playerIdsIndexed || {}).length
+  const needed = Math.ceil(totalPlayers / 2) || 3
 
   await channel.send(playerIdsIndexedToMentions(playerIdsIndexed))
   await channel.send({
     embed: {
       color: 2201331,
-      title: `Lobby ${lobby.name} - ${REQUIRED_PLAYERS} players found`,
-      description: 'Please vote for your desired team structure.',
+      title: `Lobby ${lobby.name} - ${totalPlayers} players found`,
+      description: `Vote for your desired team structure. First to **${needed}** wins.\n` +
+                   `No decision in **${Math.round(VOTE_TIMEOUT_MS/60000)} minutes** → lobby auto-disbands.`,
       fields: [
-        { name: 'Vote for random teams', value: commandToString.r, inline: true },
-        { name: 'Vote for captains', value: commandToString.c, inline: true },
-        { name: 'Vote Status', value: `You can check the vote status by typing ${commandToString.votestatus}` },
+        { name: 'Random teams', value: commandToString.r, inline: true },
+        { name: 'Captains', value: commandToString.c, inline: true },
+        { name: 'Vote Status', value: `Type ${commandToString.votestatus}` },
       ],
     },
   })
+
+  // schedule auto-disband if no decision
+  queue._voteTimeout = setTimeout(() => {
+    if (!queue.votingInProgress) return
+    queue.votingInProgress = false
+    queue._voteTimeout = null
+    channel.send('No decision reached in time. **Lobby auto-disbanded.** Players may queue again.')
+    // full reset: let queue manager remove/clear this queue
+    const { deletePlayerQueue } = require('../utils/managePlayerQueues')
+    deletePlayerQueue(queue.lobby.id)
+  }, VOTE_TIMEOUT_MS)
 }

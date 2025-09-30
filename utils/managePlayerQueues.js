@@ -40,31 +40,20 @@ function getGuildState(guildId) {
 // ---- queue template ----
 const queueResetValues = {
   votingInProgress: false,
-  votes: {
-    r: 0,
-    c: 0,
-    playersWhoVoted: {},
-  },
+  votes: { r: 0, c: 0, playersWhoVoted: {} },
   creatingTeamsInProgress: false,
   teams: {
-    blue: {
-      players: [],
-      captain: undefined,
-      voiceChannelID: undefined,
-      voiceChannelHistory: {},
-    },
-    orange: {
-      players: [],
-      captain: undefined,
-      voiceChannelID: undefined,
-      voiceChannelHistory: {},
-    },
+    blue:   { players: [], captain: undefined, voiceChannelID: undefined, voiceChannelHistory: {} },
+    orange: { players: [], captain: undefined, voiceChannelID: undefined, voiceChannelHistory: {} },
   },
   readyToJoin: false,
 
   // Remake voting
   remakeVotes: 0,
   playersWhoRemakeVoted: {},
+
+  // runtime-only handles
+  _voteTimeout: null,
 }
 
 function createQueue(guildId) {
@@ -98,7 +87,6 @@ function createQueue(guildId) {
   queue.autoDisbandTimer = setTimeout(() => {
     const count = Object.keys(queue.playerIdsIndexed).length
     if (count < REQUIRED_PLAYERS && !queue.votingInProgress && !queue.activeMatch) {
-      // Disband silently – no W/L – players can requeue
       deletePlayerQueue(queue.lobby.id)
     }
   }, AUTODISBAND_MS)
@@ -154,6 +142,10 @@ function registerActiveMatch(queue, teamAIds, teamBIds) {
     clearTimeout(queue.autoDisbandTimer)
     queue.autoDisbandTimer = null
   }
+  if (queue._voteTimeout) {
+    clearTimeout(queue._voteTimeout)
+    queue._voteTimeout = null
+  }
 
   // Free players from queue (so they can join another queue immediately)
   const state = getGuildState(queue.guildId)
@@ -190,6 +182,7 @@ function deletePlayerQueue(lobbyId) {
     if (idx >= 0) {
       const q = state.queues[idx]
       if (q.autoDisbandTimer) clearTimeout(q.autoDisbandTimer)
+      if (q._voteTimeout) clearTimeout(q._voteTimeout)
       // clear active index
       if (q.activeMatch) {
         for (const id of [...q.activeMatch.teamAIds, ...q.activeMatch.teamBIds]) {
@@ -202,26 +195,36 @@ function deletePlayerQueue(lobbyId) {
   }
 }
 
+// IMPORTANT: fully clear players & indices so users can requeue after remake
 function resetPlayerQueue(lobbyId) {
   for (const [, state] of guildStates) {
-    const q = state.queues.find(q => q.lobby.id === lobbyId)
-    if (!q) continue
+    const idx = state.queues.findIndex(q => q.lobby.id === lobbyId)
+    if (idx === -1) continue
+    const q = state.queues[idx]
+
+    if (q.autoDisbandTimer) { clearTimeout(q.autoDisbandTimer); q.autoDisbandTimer = null }
+    if (q._voteTimeout)     { clearTimeout(q._voteTimeout);     q._voteTimeout = null }
+
     const preserved = {
-      players: q.players,
-      playerIdsIndexed: q.playerIdsIndexed,
-      lobby: q.lobby,
       guildId: q.guildId,
-      createdAt: q.createdAt,
+      lobby: q.lobby,
+      createdAt: Date.now(),
     }
-    Object.assign(q, preserved, cloneDeep(queueResetValues))
-    // restart disband timer
-    if (q.autoDisbandTimer) clearTimeout(q.autoDisbandTimer)
-    q.autoDisbandTimer = setTimeout(() => {
-      const count = Object.keys(q.playerIdsIndexed).length
-      if (count < REQUIRED_PLAYERS && !q.votingInProgress && !q.activeMatch) {
-        deletePlayerQueue(q.lobby.id)
+    // wipe players & state entirely
+    const fresh = Object.assign({}, preserved, cloneDeep(queueResetValues))
+    fresh.players = []
+    fresh.playerIdsIndexed = {}
+    fresh.activeMatch = null
+
+    // restart the pre-fill auto-disband timer
+    fresh.autoDisbandTimer = setTimeout(() => {
+      const count = Object.keys(fresh.playerIdsIndexed).length
+      if (count < REQUIRED_PLAYERS && !fresh.votingInProgress && !fresh.activeMatch) {
+        deletePlayerQueue(fresh.lobby.id)
       }
     }, AUTODISBAND_MS)
+
+    state.queues[idx] = fresh
     return
   }
 }
@@ -241,7 +244,7 @@ function kickPlayer(playerIndex, queue, messageChannel) {
 function removeOfflinePlayerFromQueue({ playerId, playerChannels, guildId }) {
   let playersQueue = findPlayersQueue(guildId, playerId)
   if (!playersQueue) {
-    // Check active matches; if player is in an active match, ignore (not in queue anymore)
+    // If player is in an active match, ignore (they're not in queue)
     const state = getGuildState(guildId)
     if (state.activeByPlayer.get(playerId)) return
     return
