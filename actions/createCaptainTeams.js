@@ -1,17 +1,16 @@
 // actions/createCaptainTeams.js
-// Enhancements:
-// - Reaction-based captain picking in **DMs** (first captain picks 1, second captain picks 2, last auto).
-// - Sends each captain a scouting card: per-player MMR, lifetime W/L, monthly ΔMMR.
-// - Publishes “currently picking” state in queue.draft so !status can show it.
-// - Creates team voice channels after teams are finalized.
+// Reaction-based captain draft in **DMs**, with per-player scouting cards.
+// Fixes: use the global client to fetch User objects (not GuildMember) so DMs work
+// even without privileged member intents. Also keeps queue.draft currentPicker so
+// !status can show who's picking. Creates voice channels after teams finalize.
 
 const { getStats, upsertPlayer } = require('../db')
 const createVoiceChannels = require('./createVoiceChannels')
 
-// 7 minutes per pick step (matches your vote timeout vibe)
+// 7 minutes per pick step
 const PICK_TIMEOUT_MS = 7 * 60 * 1000
 
-const NUM_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'] // up to 4 remaining candidates
+const NUM_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'] // supports up to 4 draft-eligible
 
 function randInt(n) { return Math.floor(Math.random() * n) }
 function fmtDelta(n) { const v = Number(n) || 0; return `${v >= 0 ? '+' : ''}${v}` }
@@ -36,6 +35,7 @@ async function buildScoutingCard(guild, candidates) {
   for (let i = 0; i < candidates.length; i++) {
     const p = candidates[i]
     const mem = guild?.members?.cache?.get?.(p.id)
+                || (guild?.members?.fetch ? await guild.members.fetch(p.id).catch(()=>null) : null)
     const uname = mem?.user?.username || p.username || String(p.id)
     try { await upsertPlayer({ guildId, userId: p.id, username: uname }) } catch {}
     const s = await statsLine(guildId, p.id, uname)
@@ -44,9 +44,9 @@ async function buildScoutingCard(guild, candidates) {
   return lines
 }
 
-async function sendPickDM({ captainMember, header, candidates }) {
-  const lines = await buildScoutingCard(captainMember.guild, candidates)
-  const dm = await captainMember.createDM()
+async function sendPickDM({ user, header, guild, candidates }) {
+  const lines = await buildScoutingCard(guild, candidates)
+  const dm = await user.createDM()
   const body =
     `${header}\n\n` +
     `**Draft-Eligible Players**\n` +
@@ -57,7 +57,7 @@ async function sendPickDM({ captainMember, header, candidates }) {
 
   const msg = await dm.send(body)
 
-  // react with the available indices
+  // react with available indices
   for (let i = 0; i < Math.min(candidates.length, NUM_EMOJI.length); i++) {
     // eslint-disable-next-line no-await-in-loop
     await msg.react(NUM_EMOJI[i])
@@ -69,6 +69,7 @@ async function sendPickDM({ captainMember, header, candidates }) {
 module.exports = async (eventObj, queue) => {
   const channel = eventObj.channel
   const guild   = eventObj.guild
+  const client  = require('../index') // global Discord.Client we logged in with
 
   // normalize
   queue.players = (queue.players || []).filter(Boolean)
@@ -103,36 +104,44 @@ module.exports = async (eventObj, queue) => {
     }
   })
 
+  // Resolve User objects (NOT GuildMember) so we can DM regardless of intents
+  const blueUser   = client.users?.cache?.get?.(blueCap.id)   || await client.users.fetch(blueCap.id).catch(()=>null)
+  const orangeUser = client.users?.cache?.get?.(orangeCap.id) || await client.users.fetch(orangeCap.id).catch(()=>null)
+
+  if (!blueUser || !orangeUser) {
+    await channel.send('Could not DM captains (couldn’t fetch user objects). Ask them to enable DMs or ensure the bot can fetch users.')
+    // Still proceed? Safer to abort to avoid stuck drafts
+    queue.draft.currentPicker = null
+    return
+  }
+
   // randomize who picks first
   const first = Math.random() < 0.5 ? 'blue' : 'orange'
   const second = first === 'blue' ? 'orange' : 'blue'
   queue.draft.currentPicker = first
 
-  const blueMem   = guild.members.cache.get(blueCap.id)   || await guild.members.fetch(blueCap.id).catch(()=>null)
-  const orangeMem = guild.members.cache.get(orangeCap.id) || await guild.members.fetch(orangeCap.id).catch(()=>null)
+  const emojiToIndex = Object.fromEntries(NUM_EMOJI.map((e, i) => [e, i + 1]))
 
-  if (!blueMem || !orangeMem) {
-    await channel.send('Could not DM captains (missing guild members). Draft canceled.')
+  // ---------- FIRST PICK (1) via DM ----------
+  const firstUser = first === 'blue' ? blueUser : orangeUser
+  let firstMsg
+  try {
+    firstMsg = await sendPickDM({ user: firstUser, header: `You have **first pick** for **${queue?.lobby?.name || 'Lobby'}**.`, guild, candidates: pool })
+  } catch (e) {
+    await channel.send(`<@${firstUser.id}> I could not DM you. Please enable DMs from server members and try again.`)
     queue.draft.currentPicker = null
     return
   }
 
-  const emojiToIndex = Object.fromEntries(NUM_EMOJI.map((e, i) => [e, i + 1]))
-
-  // ---------- FIRST PICK (1) via DM ----------
-  const firstMem = first === 'blue' ? blueMem : orangeMem
-  const firstHeader = `You have **first pick** for lobby **${queue?.lobby?.name || 'Lobby'}**.`
-  const firstMsg = await sendPickDM({ captainMember: firstMem, header: firstHeader, candidates: pool })
-
   const firstCollector = firstMsg.createReactionCollector(
-    (r, u) => u.id === firstMem.id && emojiToIndex[r.emoji.name] && emojiToIndex[r.emoji.name] <= pool.length,
+    (r, u) => u.id === firstUser.id && emojiToIndex[r.emoji.name] && emojiToIndex[r.emoji.name] <= pool.length,
     { time: PICK_TIMEOUT_MS }
   )
 
   const firstResult = await new Promise((resolve) => {
     firstCollector.on('collect', (r) => {
       firstCollector.stop('picked')
-      resolve(emojiToIndex[r.emoji.name] - 1) // 0-based
+      resolve(emojiToIndex[r.emoji.name] - 1) // 0-based index
     })
     firstCollector.on('end', (_, reason) => { if (reason !== 'picked') resolve(null) })
   })
@@ -151,12 +160,18 @@ module.exports = async (eventObj, queue) => {
 
   // ---------- SECOND PICK (2) via DM ----------
   queue.draft.currentPicker = second
-  const secondMem = second === 'blue' ? blueMem : orangeMem
-  const secondHeader = `You have **two picks** for lobby **${queue?.lobby?.name || 'Lobby'}**.`
-  const secondMsg = await sendPickDM({ captainMember: secondMem, header: secondHeader, candidates: pool })
+  const secondUser = second === 'blue' ? blueUser : orangeUser
+  let secondMsg
+  try {
+    secondMsg = await sendPickDM({ user: secondUser, header: `You have **two picks** for **${queue?.lobby?.name || 'Lobby'}**.`, guild, candidates: pool })
+  } catch (e) {
+    await channel.send(`<@${secondUser.id}> I could not DM you. Please enable DMs from server members and try again.`)
+    queue.draft.currentPicker = null
+    return
+  }
 
   const secondCollector = secondMsg.createReactionCollector(
-    (r, u) => u.id === secondMem.id && emojiToIndex[r.emoji.name] && emojiToIndex[r.emoji.name] <= pool.length,
+    (r, u) => u.id === secondUser.id && emojiToIndex[r.emoji.name] && emojiToIndex[r.emoji.name] <= pool.length,
     { time: PICK_TIMEOUT_MS }
   )
 
@@ -187,7 +202,7 @@ module.exports = async (eventObj, queue) => {
   queue.teams[second].players.push(...secondPicks)
   queue.draft.unpicked = pool.map(p => p.id)
 
-  // last player goes to first team
+  // last goes to first team
   if (pool.length === 1) {
     queue.teams[first].players.push(pool.pop())
     queue.draft.unpicked = []
@@ -195,7 +210,7 @@ module.exports = async (eventObj, queue) => {
 
   queue.draft.currentPicker = null
 
-  // Announce completed teams
+  // Publish teams
   await channel.send({
     embed: {
       color: 3066993,

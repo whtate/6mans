@@ -1,6 +1,6 @@
 // onHandlers/message.js
 
-// Actions (direct imports to avoid circular dependency)
+// Actions
 const enterQueue      = require('../actions/enterQueue')
 const leaveQueue      = require('../actions/leaveQueue')
 const getQueueStatus  = require('../actions/getQueueStatus')
@@ -87,6 +87,31 @@ async function deleteTeamVoiceChannels(queue, guild) {
   }
 }
 
+// Resolve a displayable username for a userId; also refresh DB with the resolved name.
+async function resolveUsername({ client, guild, guildId, userId }) {
+  // 1) Try guild member
+  try {
+    const mem = guild?.members?.cache?.get?.(userId)
+             || (guild?.members?.fetch ? await guild.members.fetch(userId).catch(()=>null) : null)
+    if (mem?.user?.username) {
+      try { await upsertPlayer({ guildId, userId, username: mem.user.username }) } catch {}
+      return mem.user.username
+    }
+  } catch (_) {}
+
+  // 2) Try client.users.fetch (works without member intents)
+  try {
+    const u = client.users?.cache?.get?.(userId) || await client.users.fetch(userId)
+    if (u?.username) {
+      try { await upsertPlayer({ guildId, userId, username: u.username }) } catch {}
+      return u.username
+    }
+  } catch (_) {}
+
+  // 3) Fallback
+  return String(userId)
+}
+
 // ---------- handler ----------
 
 module.exports = async (eventObj, botUser = { id: undefined }) => {
@@ -98,6 +123,7 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
   const guildId = eventObj.guild?.id
   const channel = eventObj.channel
   const guild = eventObj.guild
+  const client = require('../index')
 
   const commonLogCheck = debugLogs === 'true' && authorId !== botUser.id
 
@@ -221,7 +247,7 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       )
     }
 
-    // ---------- LEADERBOARD (code block, resolve numeric usernames to names if possible) ----------
+    // ---------- LEADERBOARD (always resolve usernames; update DB in the process) ----------
     case commandToString.leaderboard:
     case '!leaderboard': {
       const arg = (rest[0] || '').trim();
@@ -247,11 +273,14 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
         '```' + '\n' +
         '#  NAME                 W   L   MMR  ΔMMR\n' +
         '----------------------------------------------'
-      const lines = rows.map((r, i) => {
+
+      const out = [header]
+      for (let i = 0; i < rows.length; i++) {
+        const r = rows[i]
+        // If DB stored a numeric "username", resolve and also refresh DB
         let display = r.username
-        if (/^\d{16,}$/.test(display || '')) {
-          const mem = guild?.members?.cache?.get?.(r.user_id)
-          display = mem?.user?.username || r.user_id
+        if (!display || /^\d{16,}$/.test(display)) {
+          display = await resolveUsername({ client, guild, guildId, userId: r.user_id })
         }
         const rank = String(i + 1).padStart(2, ' ')
         const name = String(display).padEnd(20, ' ')
@@ -259,9 +288,10 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
         const l    = String(r.month_losses || 0).padStart(3, ' ')
         const mmr  = String(r.lifetime_mmr || 0).padStart(4, ' ')
         const d    = String((r.month_mmr_delta || 0)).padStart(5, ' ')
-        return `${rank} ${name} ${w} ${l} ${mmr} ${d}`
-      })
-      return channel.send([header, ...lines, '```'].join('\n'))
+        out.push(`${rank} ${name} ${w} ${l} ${mmr} ${d}`)
+      }
+      out.push('```')
+      return channel.send(out.join('\n'))
     }
 
     // report (still !report a|b)
@@ -382,7 +412,7 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       return channel.send([header, ...lines, '```'].join('\n'))
     }
 
-    // PLAYER HISTORY (kept as !history)
+    // PLAYER HISTORY
     case commandToString.playerhistory: {
       const target = eventObj.mentions.users.first() || eventObj.author
       const rows = await getUserHistory({ guildId, userId: target.id, limit: 10 })
