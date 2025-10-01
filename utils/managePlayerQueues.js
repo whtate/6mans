@@ -381,7 +381,7 @@ function registerRemakeVote(queue, voterId) {
 }
 
 function requiredRemakeVotes() {
-  return Math.ceil(REQUIRED_PLAYERS / 2)
+  return Math.ceil((REQUIRED_PLAYERS / 2) + 1)
 }
 
 module.exports = {
