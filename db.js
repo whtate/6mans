@@ -86,36 +86,6 @@ async function getStats({ guildId, userId }) {
   return { life, month };
 }
 
-async function getLeaderboard({ guildId, limit = 10 }) {
-  const { rows } = await pool.query(
-    `WITH month_stats AS (
-       SELECT user_id,
-              SUM(CASE WHEN win THEN 1 ELSE 0 END)::int AS wins,
-              SUM(CASE WHEN win THEN 0 ELSE 1 END)::int AS losses,
-              SUM(delta)::int AS mmr_delta
-       FROM mmr_history
-       WHERE guild_id=$1
-         AND created_at >= date_trunc('month', now())
-       GROUP BY user_id
-     )
-     SELECT p.username,
-            p.user_id,
-            COALESCE(ms.wins,0)   AS month_wins,
-            COALESCE(ms.losses,0) AS month_losses,
-            COALESCE(ms.mmr_delta,0) AS month_mmr_delta,
-            p.mmr AS lifetime_mmr
-     FROM players p
-     LEFT JOIN month_stats ms ON ms.user_id = p.user_id
-     WHERE p.guild_id=$1
-     ORDER BY COALESCE(ms.wins,0) DESC,
-              COALESCE(ms.mmr_delta,0) DESC,
-              p.mmr DESC
-     LIMIT $2`,
-    [guildId, limit]
-  );
-  return rows;
-}
-
 // ---------- Elo utilities with underdog & streak scaling ----------
 
 function logisticExpected(rA, rB) {
@@ -131,8 +101,8 @@ function logisticExpected(rA, rB) {
  */
 function teamK(baseK, avgA, avgB, winner, avgWinStreak) {
   const diff = (winner === 'A') ? (avgB - avgA) : (avgA - avgB); // >0 if winner was underdog
-  const undBonus  = Math.max(0, Math.min(0.5, diff / 800));   // +0..+0.5
-  const favPenalty = Math.max(-0.33, Math.min(0, diff / -1200)); // 0..-0.33
+  const undBonus  = Math.max(0, Math.min(0.5, diff / 800));         // +0..+0.5
+  const favPenalty = Math.max(-0.33, Math.min(0, diff / -1200));    // 0..-0.33
   const streakSteps = Math.max(0, avgWinStreak - 1);
   const streakBonus = Math.min(0.20, 0.05 * streakSteps);
   const scale = 1 + undBonus + favPenalty + streakBonus;
@@ -149,6 +119,7 @@ function eloTeamDelta(avgA, avgB, winner, KA = 24, KB = 24) {
 
 /**
  * Record a result and store lobby+reporter info.
+ * Ensures players exist before updates (fixes lifetime stats).
  * Applies underdog & streak scaling and updates streaks.
  */
 async function recordResult({
@@ -158,28 +129,41 @@ async function recordResult({
   if (!['A','B'].includes(winner)) throw new Error('winner must be A or B');
   const ids = [...teamAIds, ...teamBIds];
 
-  // fetch players' mmr and streak
-  const { rows } = await pool.query(
-    `SELECT user_id, mmr, streak FROM players
-      WHERE guild_id=$1 AND user_id = ANY($2)`,
-    [guildId, ids]
-  );
-  const info = Object.fromEntries(rows.map(r => [r.user_id, { mmr: r.mmr, streak: r.streak }]));
-
-  const avgA = teamAIds.reduce((s,id)=>s+(info[id]?.mmr ?? 1000),0)/teamAIds.length;
-  const avgB = teamBIds.reduce((s,id)=>s+(info[id]?.mmr ?? 1000),0)/teamBIds.length;
-
-  const winStreaks = (winner === 'A' ? teamAIds : teamBIds).map(id => info[id]?.streak ?? 0);
-  const avgWinStreak = winStreaks.reduce((a,b)=>a+b,0) / winStreaks.length;
-
-  const baseK = 24;
-  const KA = teamK(baseK, avgA, avgB, winner, avgWinStreak);
-  const KB = teamK(baseK, avgB, avgA, winner === 'A' ? 'B' : 'A', avgWinStreak);
-  const { deltaA, deltaB } = eloTeamDelta(avgA, avgB, winner, KA, KB);
-
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
+
+    // Ensure all 6 players exist (so UPDATE hits a row)
+    for (const id of ids) {
+      await client.query(
+        `INSERT INTO players (guild_id, user_id, username)
+         VALUES ($1,$2,COALESCE(
+           (SELECT username FROM players WHERE guild_id=$1 AND user_id=$2),
+           $2
+         ))
+         ON CONFLICT (guild_id, user_id) DO NOTHING`,
+        [guildId, id]
+      );
+    }
+
+    // fetch players' mmr and streak
+    const { rows } = await client.query(
+      `SELECT user_id, mmr, streak FROM players
+        WHERE guild_id=$1 AND user_id = ANY($2::text[])`,
+      [guildId, ids]
+    );
+    const info = Object.fromEntries(rows.map(r => [r.user_id, { mmr: r.mmr, streak: r.streak }]));
+
+    const avgA = teamAIds.reduce((s,id)=>s+(info[id]?.mmr ?? 1000),0)/teamAIds.length;
+    const avgB = teamBIds.reduce((s,id)=>s+(info[id]?.mmr ?? 1000),0)/teamBIds.length;
+
+    const winStreaks = (winner === 'A' ? teamAIds : teamBIds).map(id => info[id]?.streak ?? 0);
+    const avgWinStreak = winStreaks.reduce((a,b)=>a+b,0) / winStreaks.length;
+
+    const baseK = 24;
+    const KA = teamK(baseK, avgA, avgB, winner, avgWinStreak);
+    const KB = teamK(baseK, avgB, avgA, winner === 'A' ? 'B' : 'A', avgWinStreak);
+    const { deltaA, deltaB } = eloTeamDelta(avgA, avgB, winner, KA, KB);
 
     const { rows: mrow } = await client.query(
       `INSERT INTO matches (guild_id, winner, team_a, team_b, lobby_name, lobby_region, lobby_series, reporter_user_id)
@@ -281,19 +265,16 @@ async function undoMatch({ guildId, matchId }) {
 // ---------- NEW: History queries for lobby/user/last ----------
 
 async function getLobbyHistory({ guildId, lobbyName, limit = 10 }) {
-  // Support passing just "Lobby #2" by expanding with your brand
-  const BRAND = process.env.lobbyName || 'in-house 6mans'
-  let name = lobbyName ? lobbyName.trim() : null
-  let useLike = false
+  const BRAND = process.env.lobbyName || 'in-house 6mans';
+  let name = lobbyName ? lobbyName.trim() : null;
+  let useLike = false;
 
   if (name) {
-    // If they typed only "Lobby #X", expand to "Brand — Lobby #X"
     if (/^lobby\s*#\d+$/i.test(name)) {
-      name = `${BRAND} — ${name}`
+      name = `${BRAND} — ${name}`;
     } else if (!name.includes('—') && !name.toLowerCase().includes(BRAND.toLowerCase())) {
-      // If it's a partial (doesn’t include brand), fall back to ILIKE %name%
-      useLike = true
-      name = `%${name}%`
+      useLike = true;
+      name = `%${name}%`;
     }
   }
 
@@ -305,10 +286,10 @@ async function getLobbyHistory({ guildId, lobbyName, limit = 10 }) {
         AND ${useLike ? 'lobby_name ILIKE $2' : 'lobby_name = $2'}
       ORDER BY id DESC
       LIMIT $3
-    `
-    const params = [guildId, name, limit]
-    const { rows } = await pool.query(text, params)
-    return rows
+    `;
+    const params = [guildId, name, limit];
+    const { rows } = await pool.query(text, params);
+    return rows;
   } else {
     const text = `
       SELECT id, winner, team_a, team_b, lobby_name, lobby_region, lobby_series, reporter_user_id, created_at
@@ -316,13 +297,12 @@ async function getLobbyHistory({ guildId, lobbyName, limit = 10 }) {
       WHERE guild_id=$1
       ORDER BY id DESC
       LIMIT $2
-    `
-    const params = [guildId, limit]
-    const { rows } = await pool.query(text, params)
-    return rows
+    `;
+    const params = [guildId, limit];
+    const { rows } = await pool.query(text, params);
+    return rows;
   }
 }
-
 
 async function getUserHistory({ guildId, userId, limit = 10 }) {
   const { rows } = await pool.query(
@@ -352,34 +332,83 @@ async function getLastMatches({ guildId, limit = 5 }) {
   return rows;
 }
 
-/* ===========================
-   NEW HELPERS (non-breaking)
-   =========================== */
+// ---------- NEW: Leaderboard (order by lifetime MMR w/ exclusions) ----------
 
-/**
- * Apply a sub-out penalty (e.g., -15 MMR) and record it in mmr_history.
- * Uses match_id = 0 to indicate a system adjustment, not a real match row.
- *
- * @param {Object} params
- * @param {string} params.guildId
- * @param {string} params.subOutUserId
- * @param {number} [params.amount=15] positive number; will be subtracted from MMR
- */
-async function applySubPenalty({ guildId, subOutUserId, amount = 15 }) {
+async function getLeaderboard({ guildId, limit = 10, excludeUserIds = [] }) {
+  let extraWhere = '';
+  const params = [guildId];
+
+  if (excludeUserIds && excludeUserIds.length) {
+    params.push(excludeUserIds);
+    extraWhere += ` AND p.user_id <> ALL($${params.length})`;
+  }
+
+  let limitClause = '';
+  if (Number.isFinite(limit) && limit > 0) {
+    params.push(limit);
+    limitClause = ` LIMIT $${params.length}`;
+  }
+
+  const sql = `
+    WITH month_stats AS (
+      SELECT user_id,
+             SUM(CASE WHEN win THEN 1 ELSE 0 END)::int AS wins,
+             SUM(CASE WHEN win THEN 0 ELSE 1 END)::int AS losses,
+             SUM(delta)::int AS mmr_delta
+      FROM mmr_history
+      WHERE guild_id=$1
+        AND created_at >= date_trunc('month', now())
+      GROUP BY user_id
+    )
+    SELECT p.username,
+           p.user_id,
+           COALESCE(ms.wins,0)   AS month_wins,
+           COALESCE(ms.losses,0) AS month_losses,
+           COALESCE(ms.mmr_delta,0) AS month_mmr_delta,
+           p.mmr AS lifetime_mmr
+    FROM players p
+    LEFT JOIN month_stats ms ON ms.user_id = p.user_id
+    WHERE p.guild_id=$1
+    ${extraWhere}
+    ORDER BY p.mmr DESC, p.username ASC
+    ${limitClause};
+  `;
+  const { rows } = await pool.query(sql, params);
+  return rows;
+}
+
+// ---------- OPTIONAL: Sub penalty helper (kept here, configurable via env) ----------
+
+async function applySubPenalty({ guildId, subOutUserId, amount = null, matchId = null }) {
+  const penalty = Number.isFinite(parseInt(process.env.SUB_PENALTY_MMR, 10))
+    ? parseInt(process.env.SUB_PENALTY_MMR, 10)
+    : (amount ?? 15);
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    // Deduct MMR
+
     await client.query(
-      `UPDATE players SET mmr = mmr - $1 WHERE guild_id=$2 AND user_id=$3`,
-      [amount, guildId, subOutUserId]
+      `INSERT INTO players (guild_id, user_id, username)
+       VALUES ($1,$2,$3)
+       ON CONFLICT (guild_id, user_id) DO NOTHING`,
+      [guildId, subOutUserId, String(subOutUserId)]
     );
-    // Record an auditable history row
+
+    await client.query(
+      `UPDATE players
+         SET mmr = mmr - $1
+       WHERE guild_id=$2 AND user_id=$3`,
+      [penalty, guildId, subOutUserId]
+    );
+
+    // optional: keep a row in mmr_history with matchId=null and win=false
     await client.query(
       `INSERT INTO mmr_history (guild_id, user_id, match_id, win, delta)
        VALUES ($1,$2,$3,$4,$5)`,
-      [guildId, subOutUserId, 0, false, -amount]
+      [guildId, subOutUserId, matchId || 0, false, -penalty]
     );
+
     await client.query('COMMIT');
   } catch (e) {
     await client.query('ROLLBACK');
@@ -387,31 +416,6 @@ async function applySubPenalty({ guildId, subOutUserId, amount = 15 }) {
   } finally {
     client.release();
   }
-}
-
-/**
- * Delete players from the database who are no longer in the guild.
- * Pass the list of user IDs that are still present; everyone else is pruned.
- *
- * @param {Object} params
- * @param {string} params.guildId
- * @param {string[]} params.aliveIds
- * @returns {number} count of deleted rows
- */
-async function pruneUsersNotIn({ guildId, aliveIds }) {
-  if (!Array.isArray(aliveIds)) throw new Error('aliveIds must be an array of user IDs');
-  const { rows } = await pool.query(
-    `SELECT user_id FROM players WHERE guild_id=$1`,
-    [guildId]
-  );
-  const keep = new Set(aliveIds);
-  const stale = rows.map(r => r.user_id).filter(id => !keep.has(id));
-  if (stale.length === 0) return 0;
-  await pool.query(
-    `DELETE FROM players WHERE guild_id=$1 AND user_id = ANY($2)`,
-    [guildId, stale]
-  );
-  return stale.length;
 }
 
 module.exports = {
@@ -425,7 +429,5 @@ module.exports = {
   getLobbyHistory,
   getUserHistory,
   getLastMatches,
-  // NEW exports
-  applySubPenalty,
-  pruneUsersNotIn,
+  applySubPenalty, // optional
 };
