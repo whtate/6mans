@@ -4,7 +4,9 @@
 // - Gentle no-op if already queued
 // - Starts per-player keepalive (warn DM 5m before, kick at 1h unless they react)
 // - Ensures the queue auto-disbands after inactivity (defaults to 2h; overridable via AUTODISBAND_MS)
+// - NEW: Auto-starts voting when the queue fills to REQUIRED_PLAYERS
 
+const startVote = require('./startVote')
 const {
   startKeepAlive,
   announceToQueueChannel,
@@ -25,12 +27,14 @@ const AUTODISBAND_MS =
 module.exports = async (eventObj, queue) => {
   const channel = eventObj.channel
   const playerId = eventObj.author.id
+  const username = eventObj.author.username
 
   // Standard queue shape we expect:
-  // queue.players: [{ id, ... }]
+  // queue.players: [{ id, username? }]
   // queue.playerIdsIndexed: { [discordId]: true }
   queue.players = Array.isArray(queue.players) ? queue.players : []
   queue.playerIdsIndexed = queue.playerIdsIndexed || Object.create(null)
+  queue.teams = queue.teams || { blue: { players: [] }, orange: { players: [] } } // ensure structure exists
 
   // Already in the queue?
   if (queue.playerIdsIndexed[playerId]) {
@@ -40,8 +44,8 @@ module.exports = async (eventObj, queue) => {
     )
   }
 
-  // Add player
-  const player = { id: playerId }
+  // Add player (store username if available for nicer embeds elsewhere)
+  const player = { id: playerId, username }
   queue.players.push(player)
   queue.playerIdsIndexed[playerId] = true
 
@@ -49,8 +53,6 @@ module.exports = async (eventObj, queue) => {
   try { startKeepAlive(queue, playerId) } catch (_) {}
 
   // Ensure / refresh an auto-disband timer at the queue level (2h default)
-  // This is a safety net; if you already set AUTODISBAND_MS in managePlayerQueues,
-  // this simply aligns the behavior to 2h by default unless overridden in env.
   try {
     if (queue.autoDisbandTimer) {
       clearTimeout(queue.autoDisbandTimer)
@@ -78,8 +80,24 @@ module.exports = async (eventObj, queue) => {
   // Position (1-based)
   const position = queue.players.length
 
-  // Notify
-  return channel.send(
+  // Notify join
+  await channel.send(
     `Queued ✅ <@${playerId}> — you’re **#${position}** (${position}/${REQUIRED_PLAYERS}).`
   )
+
+  // NEW: auto-start vote when full, if not already voting or in an active match
+  const size = Object.keys(queue.playerIdsIndexed || {}).length
+  if (
+    size >= REQUIRED_PLAYERS &&
+    !queue.votingInProgress &&
+    !queue.activeMatch &&
+    !queue.creatingTeamsInProgress
+  ) {
+    try {
+      await startVote(eventObj, queue)
+    } catch (e) {
+      console.error('startVote failed:', e)
+      // fall through; users can still trigger manually if you expose a command
+    }
+  }
 }
