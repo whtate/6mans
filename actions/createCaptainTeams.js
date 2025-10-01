@@ -1,50 +1,18 @@
 // actions/createCaptainTeams.js
-// Reaction-based captain draft in DMs, with per-player scouting cards.
-// v11 DM fix: use a compat user fetcher (client.users.get or client.fetchUser)
-// Adds explicit "queue expired" banner on 7-minute pick timeouts.
-// Creates voice channels when teams finalize.
+// v11-friendly DM draft:
+// - Resolve captains via guild.members.get/fetchMember → member.user.createDM()
+// - Reaction-based selection in DMs using 1️⃣ 2️⃣ 3️⃣ 4️⃣
+// - Loud 7-min timeout that expires the queue and deletes it
+// - Creates voice channels after teams are ready
 
 const { getStats, upsertPlayer } = require('../db')
 const createVoiceChannels = require('./createVoiceChannels')
 
-// 7 minutes per pick step (user request)
 const PICK_TIMEOUT_MS = 7 * 60 * 1000
-
-const NUM_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'] // supports up to 4 draft-eligible
+const NUM_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣']
 
 function randInt(n) { return Math.floor(Math.random() * n) }
 function fmtDelta(n) { const v = Number(n) || 0; return `${v >= 0 ? '+' : ''}${v}` }
-
-// ----- v11-compatible user fetch -----
-async function fetchUserCompat(client, id) {
-  // v11: client.users.get(id) exists; client.fetchUser(id) fetches from API.
-  try {
-    if (client.users && typeof client.users.get === 'function') {
-      const u = client.users.get(id)
-      if (u) return u
-    }
-  } catch (_) {}
-  try {
-    if (typeof client.fetchUser === 'function') {
-      const u = await client.fetchUser(id)
-      if (u) return u
-    }
-  } catch (_) {}
-  // v12+ fallback if the project ever upgrades
-  try {
-    if (client.users?.cache?.get) {
-      const u = client.users.cache.get(id)
-      if (u) return u
-    }
-  } catch (_) {}
-  try {
-    if (client.users?.fetch) {
-      const u = await client.users.fetch(id)
-      if (u) return u
-    }
-  } catch (_) {}
-  return null
-}
 
 async function statsLine(guildId, userId, fallbackName) {
   let mmr = 1000, w = 0, l = 0, month = 0
@@ -65,12 +33,15 @@ async function buildScoutingCard(guild, candidates) {
   const lines = []
   for (let i = 0; i < candidates.length; i++) {
     const p = candidates[i]
+    // Resolve username via guild members (v11)
     let uname = p.username || null
-    try {
-      const mem = guild?.members?.cache?.get?.(p.id)
-                || (guild?.members?.fetch ? await guild.members.fetch(p.id).catch(()=>null) : null)
-      uname = mem?.user?.username || uname || String(p.id)
-    } catch (_) {
+    let mem = guild.members.get(p.id)
+    if (!mem && guild.fetchMember) {
+      try { mem = await guild.fetchMember(p.id) } catch (_) {}
+    }
+    if (mem && mem.user) {
+      uname = mem.user.username || uname || String(p.id)
+    } else {
       uname = uname || String(p.id)
     }
     try { await upsertPlayer({ guildId, userId: p.id, username: uname }) } catch {}
@@ -80,9 +51,9 @@ async function buildScoutingCard(guild, candidates) {
   return lines
 }
 
-async function sendPickDM({ user, header, guild, candidates }) {
+async function sendPickDM({ member, header, guild, candidates }) {
   const lines = await buildScoutingCard(guild, candidates)
-  const dm = await user.createDM()
+  const dm = await member.user.createDM()
   const body =
     `${header}\n\n` +
     `**Draft-Eligible Players**\n` +
@@ -102,10 +73,26 @@ async function sendPickDM({ user, header, guild, candidates }) {
   return msg
 }
 
+function expireQueue(queue, channel, reasonText) {
+  try {
+    queue.draft && (queue.draft.currentPicker = null)
+    queue.status = 'expired'
+    queue.expiresAt = new Date().toISOString()
+  } catch (_) {}
+  channel.send({
+    embed: {
+      color: 15158332,
+      title: `Lobby ${queue?.lobby?.name || 'Lobby'} — Queue expired`,
+      description: reasonText || 'No picks received in time. The queue has been **disbanded**.'
+    }
+  })
+  const { deletePlayerQueue } = require('../utils/managePlayerQueues')
+  deletePlayerQueue(queue.lobby.id)
+}
+
 module.exports = async (eventObj, queue) => {
   const channel = eventObj.channel
   const guild   = eventObj.guild
-  const client  = require('../index') // your Discord.Client from index.js
 
   // normalize
   queue.players = (queue.players || []).filter(Boolean)
@@ -140,13 +127,19 @@ module.exports = async (eventObj, queue) => {
     }
   })
 
-  // Resolve users via v11-compatible fetch to ensure DMs can be sent
-  const blueUser   = await fetchUserCompat(client, blueCap.id)
-  const orangeUser = await fetchUserCompat(client, orangeCap.id)
+  // Resolve GuildMembers (v11) to DM captains
+  let blueMem = guild.members.get(blueCap.id)
+  if (!blueMem && guild.fetchMember) {
+    try { blueMem = await guild.fetchMember(blueCap.id) } catch (_) {}
+  }
+  let orangeMem = guild.members.get(orangeCap.id)
+  if (!orangeMem && guild.fetchMember) {
+    try { orangeMem = await guild.fetchMember(orangeCap.id) } catch (_) {}
+  }
 
-  if (!blueUser || !orangeUser) {
-    await channel.send('Could not DM captains (couldn’t fetch user objects). Ask them to enable DMs or ensure the bot can fetch users.')
-    queue.draft.currentPicker = null
+  if (!blueMem || !orangeMem) {
+    await channel.send('Could not DM captains (couldn’t resolve guild members). Ask them to enable DMs / check bot permissions.')
+    expireQueue(queue, channel, 'Captains could not be contacted via DM.')
     return
   }
 
@@ -158,18 +151,24 @@ module.exports = async (eventObj, queue) => {
   const emojiToIndex = Object.fromEntries(NUM_EMOJI.map((e, i) => [e, i + 1]))
 
   // ---------- FIRST PICK (1) via DM ----------
-  const firstUser = first === 'blue' ? blueUser : orangeUser
   let firstMsg
   try {
-    firstMsg = await sendPickDM({ user: firstUser, header: `You have **first pick** for **${queue?.lobby?.name || 'Lobby'}**.`, guild, candidates: pool })
+    firstMsg = await sendPickDM({
+      member: first === 'blue' ? blueMem : orangeMem,
+      header: `You have **first pick** for **${queue?.lobby?.name || 'Lobby'}**.`,
+      guild,
+      candidates: pool
+    })
   } catch (e) {
-    await channel.send(`<@${firstUser.id}> I could not DM you. Please enable DMs from server members and try again.`)
-    queue.draft.currentPicker = null
+    await channel.send(`I couldn’t DM the captain for the first pick. Make sure DMs are enabled.`)
+    expireQueue(queue, channel, 'First pick could not be completed.')
     return
   }
 
   const firstCollector = firstMsg.createReactionCollector(
-    (r, u) => u.id === firstUser.id && emojiToIndex[r.emoji.name] && emojiToIndex[r.emoji.name] <= pool.length,
+    (r, u) => u.id === (first === 'blue' ? blueMem.id : orangeMem.id) &&
+              emojiToIndex[r.emoji.name] &&
+              emojiToIndex[r.emoji.name] <= pool.length,
     { time: PICK_TIMEOUT_MS }
   )
 
@@ -178,25 +177,13 @@ module.exports = async (eventObj, queue) => {
       firstCollector.stop('picked')
       resolve(emojiToIndex[r.emoji.name] - 1) // 0-based index
     })
-    firstCollector.on('end', async (_, reason) => {
+    firstCollector.on('end', (_, reason) => {
       if (reason !== 'picked') resolve(null)
     })
   })
 
   if (firstResult == null) {
-    // Mark expired & announce loudly in queue channel
-    queue.draft.currentPicker = null
-    queue.status = 'expired'
-    queue.expiresAt = new Date().toISOString()
-    await channel.send({
-      embed: {
-        color: 15158332,
-        title: `Lobby ${queue?.lobby?.name || 'Lobby'} — Queue expired`,
-        description: `No pick received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes. The queue has been **disbanded**.`
-      }
-    })
-    const { deletePlayerQueue } = require('../utils/managePlayerQueues')
-    deletePlayerQueue(queue.lobby.id)
+    expireQueue(queue, channel, `No pick received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
     return
   }
 
@@ -206,22 +193,28 @@ module.exports = async (eventObj, queue) => {
 
   // ---------- SECOND PICK (2) via DM ----------
   queue.draft.currentPicker = second
-  const secondUser = second === 'blue' ? blueUser : orangeUser
   let secondMsg
   try {
-    secondMsg = await sendPickDM({ user: secondUser, header: `You have **two picks** for **${queue?.lobby?.name || 'Lobby'}**.`, guild, candidates: pool })
+    secondMsg = await sendPickDM({
+      member: second === 'blue' ? blueMem : orangeMem,
+      header: `You have **two picks** for **${queue?.lobby?.name || 'Lobby'}**.`,
+      guild,
+      candidates: pool
+    })
   } catch (e) {
-    await channel.send(`<@${secondUser.id}> I could not DM you. Please enable DMs from server members and try again.`)
-    queue.draft.currentPicker = null
+    await channel.send(`I couldn’t DM the captain for the second pick. Make sure DMs are enabled.`)
+    expireQueue(queue, channel, 'Second pick could not be completed.')
     return
   }
 
+  const chosen = new Set()
   const secondCollector = secondMsg.createReactionCollector(
-    (r, u) => u.id === secondUser.id && emojiToIndex[r.emoji.name] && emojiToIndex[r.emoji.name] <= pool.length,
+    (r, u) => u.id === (second === 'blue' ? blueMem.id : orangeMem.id) &&
+              emojiToIndex[r.emoji.name] &&
+              emojiToIndex[r.emoji.name] <= pool.length,
     { time: PICK_TIMEOUT_MS }
   )
 
-  const chosen = new Set()
   await new Promise((resolve) => {
     secondCollector.on('collect', (r) => {
       const idx1b = emojiToIndex[r.emoji.name]
@@ -238,18 +231,7 @@ module.exports = async (eventObj, queue) => {
   })
 
   if (chosen.size < 2) {
-    queue.draft.currentPicker = null
-    queue.status = 'expired'
-    queue.expiresAt = new Date().toISOString()
-    await channel.send({
-      embed: {
-        color: 15158332,
-        title: `Lobby ${queue?.lobby?.name || 'Lobby'} — Queue expired`,
-        description: `No picks received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes. The queue has been **disbanded**.`
-      }
-    })
-    const { deletePlayerQueue } = require('../utils/managePlayerQueues')
-    deletePlayerQueue(queue.lobby.id)
+    expireQueue(queue, channel, `No picks received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
     return
   }
 
@@ -282,7 +264,7 @@ module.exports = async (eventObj, queue) => {
   try {
     await createVoiceChannels(eventObj, queue)
   } catch (e) {
-    console.error('createVoiceChannels failed after draft', e?.message || e)
+    console.error('createVoiceChannels failed after draft', e && e.message)
     await channel.send('Voice channel creation failed. An admin may need to check bot permissions.')
   }
 }
