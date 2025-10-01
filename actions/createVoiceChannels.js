@@ -25,11 +25,12 @@ module.exports = async (eventObj, queue) => {
       return channel.send('Could not find @everyone role. Check the bot permissions/roles.')
     }
 
-    // 1) Create Blue voice channel (no permission_overwrites at creation)
-    const blueVoice = await guild.createChannel(`${lobby.name}-blue`, 'voice', {
-      parent: parentCategory.id,
-      userLimit: 3,
-    })
+    // --- CREATE BLUE ---
+    // v11 signature: createChannel(name, type, permissionOverwrites, reason)
+    // -> do NOT pass an options object here; set parent/limit after creation
+    const blueVoice = await guild.createChannel(`${lobby.name}-blue`, 'voice')
+    await blueVoice.setParent(parentCategory.id)
+    await blueVoice.setUserLimit(3)
 
     // Deny for @everyone
     await blueVoice.overwritePermissions(everyoneRole, {
@@ -47,20 +48,16 @@ module.exports = async (eventObj, queue) => {
       })
     }
 
-    // 2) Create Orange voice channel
-    const orangeVoice = await guild.createChannel(`${lobby.name}-orange`, 'voice', {
-      parent: parentCategory.id,
-      userLimit: 3,
-    })
+    // --- CREATE ORANGE ---
+    const orangeVoice = await guild.createChannel(`${lobby.name}-orange`, 'voice')
+    await orangeVoice.setParent(parentCategory.id)
+    await orangeVoice.setUserLimit(3)
 
-    // Deny for @everyone
     await orangeVoice.overwritePermissions(everyoneRole, {
       CONNECT: false,
       SPEAK: false,
       CREATE_INSTANT_INVITE: false,
     })
-
-    // Allow for each orange player
     for (const p of (teams.orange.players || [])) {
       if (!p || !p.id) continue
       await orangeVoice.overwritePermissions(p.id, {
@@ -80,5 +77,10 @@ module.exports = async (eventObj, queue) => {
   } catch (err) {
     console.error('Failed to create voice channels:', err)
     channel.send('I could not create team voice channels. Check my permissions and try again.')
+  } finally {
+    // Debug: show what's in queue after trying to create channels
+    try {
+      console.log('createVoiceChannel finished, queue:', JSON.stringify(queue, null, 2))
+    } catch {}
   }
 }
