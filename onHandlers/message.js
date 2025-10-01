@@ -140,6 +140,24 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
   const command = rawCommand
   const playerId = eventObj.author.id
 
+  // NEW: proactively upsert author's username (and any mentioned users) so we don't store numeric IDs as usernames
+  try {
+    await upsertPlayer({
+      guildId,
+      userId: eventObj.author.id,
+      username: eventObj.author.username
+    })
+    eventObj.mentions?.users?.forEach?.(u => {
+      upsertPlayer({
+        guildId,
+        userId: u.id,
+        username: u.username
+      }).catch(()=>{})
+    })
+  } catch (e) {
+    console.error('upsertPlayer (author/mentions) failed', e?.message || e)
+  }
+
   // Place user into a queue for join-related commands; else we may use active-match lookup.
   let queue = determinePlayerQueue(playerId, command, guildId)
 
@@ -259,14 +277,16 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       const rows = await getLeaderboard({ guildId, limit, excludeUserIds, excludeUsernames, minGames });
       if (!rows.length) return channel.send('No players found.');
 
-      const header = `**Leaderboard by MMR (${limit ? `Top ${rows.length}` : `All ${rows.length}`})**\n\`\`\`\n#   MMR   W   L  ΔMMR  NAME\n---------------------------------------`;
+      const header = `**Leaderboard by MMR (${limit ? `Top ${rows.length}` : `All ${rows.length}`})**\n\`\`\`\n#  NAME                 W   L   MMR  ΔMMR\n----------------------------------------------`;
       const lines = rows.map((r, i) => {
         const rank = String(i + 1).padStart(2, ' ');
-        const mmr  = String(r.lifetime_mmr || 0).padStart(4, ' ');
+        const nameValue = (/^\d{16,}$/.test(r.username || '') ? `<@${r.user_id}>` : r.username);
+        const name = String(nameValue).padEnd(20, ' ');
         const w    = String(r.month_wins || 0).padStart(3, ' ');
         const l    = String(r.month_losses || 0).padStart(3, ' ');
+        const mmr  = String(r.lifetime_mmr || 0).padStart(4, ' ');
         const d    = String((r.month_mmr_delta || 0)).padStart(5, ' ');
-        return `${rank} ${mmr} ${w} ${l} ${d}  ${r.username}`;
+        return `${rank} ${name} ${w} ${l} ${mmr} ${d}`;
       });
       return channel.send([header, ...lines, '```'].join('\n'));
     }

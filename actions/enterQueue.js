@@ -5,6 +5,7 @@
 // - Starts per-player keepalive (warn DM 5m before, kick at 1h unless they react)
 // - Ensures the queue auto-disbands after inactivity (defaults to 2h; overridable via AUTODISBAND_MS)
 // - NEW: Auto-starts voting when the queue fills to REQUIRED_PLAYERS
+// - NEW: Upserts username to DB so we never keep numeric IDs as usernames
 
 const startVote = require('./startVote')
 const {
@@ -12,6 +13,7 @@ const {
   announceToQueueChannel,
   deletePlayerQueue,
 } = require('../utils/managePlayerQueues')
+const { upsertPlayer } = require('../db')
 
 const REQUIRED_PLAYERS =
   Number.isFinite(parseInt(process.env.REQUIRED_PLAYERS, 10))
@@ -25,9 +27,17 @@ const AUTODISBAND_MS =
     : (2 * 60 * 60 * 1000) // 2h
 
 module.exports = async (eventObj, queue) => {
-  const channel = eventObj.channel
+  const channel  = eventObj.channel
+  const guildId  = eventObj.guild?.id
   const playerId = eventObj.author.id
   const username = eventObj.author.username
+
+  // Proactively save/refresh username so leaderboard/stats don't show numeric IDs
+  try {
+    await upsertPlayer({ guildId, userId: playerId, username })
+  } catch (e) {
+    console.error('enterQueue upsertPlayer failed', e?.message || e)
+  }
 
   // Standard queue shape we expect:
   // queue.players: [{ id, username? }]

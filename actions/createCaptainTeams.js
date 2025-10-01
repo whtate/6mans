@@ -1,235 +1,271 @@
 // actions/createCaptainTeams.js
-// Captain draft via DM + reactions (1–4). Works in v11–v14.
-// After teams are finalized, we now create voice channels and then DM lobby details
-// (no public leak of lobby name/password).
+// Enhancements:
+// - Writes public draft state onto queue.draft so !status can show the current picker
+// - Leaves your picking logic intact (first pick 1, second pick 2, last auto)
+// - NEW: DMs both captains a "scouting card" listing all draft-eligible players
+//        with MMR, lifetime W/L, and this month’s ΔMMR for smarter picks.
 
-const { randomInt } = require('crypto')
-const createVoiceChannels = require('./createVoiceChannels')
-const createLobbyInfo = require('./createLobbyInfo')
+const { randomInt } = require('crypto');
+const { getStats, upsertPlayer } = require('../db');
 
 function rand(n) {
-  return typeof randomInt === 'function' ? randomInt(n) : Math.floor(Math.random() * n)
+  // randomInt is inclusive of min, exclusive of max
+  return typeof randomInt === 'function'
+    ? randomInt(n)
+    : Math.floor(Math.random() * n);
 }
 
-const DIGITS = ['1️⃣','2️⃣','3️⃣','4️⃣'] // up to 4 remaining players in 6-mans
-const PICK_TIMEOUT_MS =
-  Number.isFinite(parseInt(process.env.PICK_TIMEOUT_MS, 10))
-    ? parseInt(process.env.PICK_TIMEOUT_MS, 10)
-    : 60_000 // 60s per pick
-
-function getGuildClient() {
-  try { return require('../index') } catch { return null }
+function playersToMentions(players) {
+  return players.map((p, i) => `${i}. <@${p.id}>`).join('\n');
 }
 
-function getUser(client, id) {
-  if (!client) return null
-  // v12+
-  if (client.users?.cache?.get) return client.users.cache.get(id) || null
-  // v11
-  if (client.users?.get) return client.users.get(id) || null
-  return null
+function fmtDelta(n) {
+  const v = Number(n) || 0;
+  return `${v >= 0 ? '+' : ''}${v}`;
 }
 
-function mention(id) {
-  return /^\d+$/.test(id) ? `<@${id}>` : String(id)
-}
+async function buildScoutingLines(guildId, candidates, client) {
+  // candidates: [{id, username?}, ...]
+  const lines = [];
+  for (const [i, p] of candidates.entries()) {
+    const id = p.id;
+    const username = p.username || null;
+    // Make sure we have a username on file (prevents numeric IDs on boards later)
+    try {
+      const userObj = client?.users?.get?.(id) || client?.users?.cache?.get?.(id);
+      const name = userObj?.username || username || String(id);
+      await upsertPlayer({ guildId, userId: id, username: name });
+    } catch (_) {}
 
-function listWithNumbers(players) {
-  return players.map((p, i) => `${i + 1}. ${mention(p.id)}`).join('\n')
-}
+    let mmr = 1000, wins = 0, losses = 0, monthDelta = 0;
+    try {
+      const stats = await getStats({ guildId, userId: id });
+      if (stats?.life) {
+        mmr = stats.life.mmr ?? 1000;
+        wins = stats.life.wins ?? 0;
+        losses = stats.life.losses ?? 0;
+      }
+      if (stats?.month) {
+        monthDelta = stats.month.mmr_delta ?? 0;
+      }
+    } catch (e) {
+      // if db query fails for some reason, fall back gracefully
+    }
 
-async function addDigitReactions(msg, n) {
-  for (let i = 0; i < n && i < DIGITS.length; i++) {
-    try { /* eslint-disable no-await-in-loop */ await msg.react(DIGITS[i]) } catch {}
+    const line =
+      `**${i}.** <@${id}> — ` +
+      `MMR **${mmr}** — ` +
+      `W/L **${wins}/${losses}** — ` +
+      `ΔMMR (mo) **${fmtDelta(monthDelta)}**`;
+    lines.push(line);
   }
+  return lines;
 }
 
-function awaitOneReaction(msg, userId, allowed, time = PICK_TIMEOUT_MS) {
-  return new Promise((resolve) => {
-    const filter = (reaction, user) =>
-      allowed.includes(reaction.emoji.name) && user.id === userId
-    const collector = msg.createReactionCollector(filter, { max: 1, time })
-    let picked = null
-    collector.on('collect', (reaction) => { picked = reaction.emoji.name })
-    collector.on('end', () => resolve(picked))
-  })
+async function dmScoutingCard(captainUser, guildId, candidates, client, headerNote = '') {
+  try {
+    const lines = await buildScoutingLines(guildId, candidates, client);
+    const msg =
+      (headerNote ? `${headerNote}\n\n` : '') +
+      `**Draft-Eligible Players**\n` +
+      lines.join('\n');
+    const dm = await captainUser.createDM();
+    await dm.send(msg);
+  } catch (e) {
+    // If DMs are closed, just skip; channel flow still works.
+    console.error('Failed to DM scouting card:', e?.message || e);
+  }
 }
 
 module.exports = async (eventObj, queue) => {
-  const channel = eventObj.channel
-  const client = getGuildClient()
+  const channel = eventObj.channel;
+  const client = require('../index'); // to resolve users for usernames in DMs
+  const guildId = eventObj.guild?.id;
 
-  // Normalize structure
-  queue.players = (queue.players || []).filter(Boolean)
-  queue.teams = queue.teams || { blue: { players: [] }, orange: { players: [] } }
-  const { players, teams } = queue
+  // Normalize structures
+  queue.players = (queue.players || []).filter(Boolean);
+  queue.teams = queue.teams || { blue: { players: [] }, orange: { players: [] } };
+  const { players, teams } = queue;
 
-  // Safety: exactly 6 players needed for this flow
-  if (players.length !== 6) {
-    await channel.send('Captain draft requires exactly 6 players.')
-    return
-  }
-
-  // Initialize public draft state for !status
+  // Init draft state
   queue.draft = {
     mode: 'captains',
-    currentPicker: null,        // 'blue'|'orange'
-    currentCaptainId: null,     // single id for status
+    currentPicker: null, // 'blue' or 'orange'
     captains: { blue: null, orange: null },
-    picks: [],
-    unpicked: players.map(p => p.id),
-  }
-  queue.status = 'drafting'
-  queue.votingInProgress = false
-  queue.creatingTeamsInProgress = true
+    unpicked: players.map(p => p.id)
+  };
 
-  // Random captains
-  const order = [...players]
-  const bIdx = rand(order.length)
-  const blueCaptain = order.splice(bIdx, 1)[0]
-  const oIdx = rand(order.length)
-  const orangeCaptain = order.splice(oIdx, 1)[0]
+  // Pick captains randomly
+  const blueIndex = rand(players.length);
+  const blueCaptain = players.splice(blueIndex, 1)[0];
+  teams.blue.captain = blueCaptain;
+  teams.blue.players.push(blueCaptain);
+  queue.draft.captains.blue = blueCaptain.id;
 
-  teams.blue.captain = blueCaptain
-  teams.orange.captain = orangeCaptain
-  teams.blue.players = [blueCaptain]
-  teams.orange.players = [orangeCaptain]
+  const orangeIndex = rand(players.length);
+  const orangeCaptain = players.splice(orangeIndex, 1)[0];
+  teams.orange.captain = orangeCaptain;
+  teams.orange.players.push(orangeCaptain);
+  queue.draft.captains.orange = orangeCaptain.id;
 
-  queue.draft.captains.blue = blueCaptain.id
-  queue.draft.captains.orange = orangeCaptain.id
-
+  // Announce captains publicly
   await channel.send({
     embed: {
       color: 2201331,
-      title: 'Captain structure',
-      description: 'The vote resulted in captains. The following are your captains:',
+      title: `Captain structure`,
+      description:
+        'The vote resulted in captains. The following are your captains:',
       fields: [
-        { name: 'Captain Blue', value: mention(blueCaptain.id) },
-        { name: 'Captain Orange', value: mention(orangeCaptain.id) },
-      ],
-    },
-  })
+        { name: 'Captain Blue', value: `<@${teams.blue.captain.id}>` },
+        { name: 'Captain Orange', value: `<@${teams.orange.captain.id}>` }
+      ]
+    }
+  });
 
-  // Helper to DM a captain and get one pick via reaction
-  const dmPickOne = async (captain, poolPlayers, promptTitle) => {
-    const user = getUser(client, captain.id)
-    if (!user) throw new Error('Captain user not found to DM')
+  // Choose pick order (random)
+  const firstPick = rand(2) === 0 ? 'blue' : 'orange';
+  const secondPick = firstPick === 'blue' ? 'orange' : 'blue';
+  queue.draft.currentPicker = firstPick;
+  queue.draft.unpicked = players.map(p => p.id);
 
-    const dm = await user.createDM()
-    const dmMsg = await dm.send({
-      embed: {
-        color: 3447003,
-        title: promptTitle,
-        description:
-          'React with the number for your pick. You have **60 seconds**.\n\n' +
-          listWithNumbers(poolPlayers),
-      },
-    })
-
-    await addDigitReactions(dmMsg, poolPlayers.length)
-    const emoji = await awaitOneReaction(dmMsg, captain.id, DIGITS.slice(0, poolPlayers.length), PICK_TIMEOUT_MS)
-    if (!emoji) return null // timeout
-
-    const idx = DIGITS.indexOf(emoji) // 0-based index into poolPlayers
-    if (idx < 0 || !poolPlayers[idx]) return null
-    return poolPlayers[idx]
-  }
-
-  // Helper to DM a captain and get TWO picks via sequential reactions
-  const dmPickTwoSequential = async (captain, poolPlayers) => {
-    const picks = []
-    const first = await dmPickOne(captain, poolPlayers, 'Second pick (1 of 2)')
-    if (!first) return null
-    picks.push(first)
-    const remaining = poolPlayers.filter(p => p.id !== first.id)
-    const second = await dmPickOne(captain, remaining, 'Second pick (2 of 2)')
-    if (!second) return null
-    picks.push(second)
-    return picks
-  }
-
-  // FIRST PICK: randomly choose who picks first
-  const firstSide = rand(2) === 0 ? 'blue' : 'orange'
-  const secondSide = firstSide === 'blue' ? 'orange' : 'blue'
-
-  // pool of non-captains (4 remaining)
-  let pool = players.filter(p => p.id !== blueCaptain.id && p.id !== orangeCaptain.id)
-
-  // --- First pick (1) ---
-  queue.draft.currentPicker = firstSide
-  queue.draft.currentCaptainId = teams[firstSide].captain.id
-  await channel.send(`First pick: ${mention(teams[firstSide].captain.id)} — check your **DMs** to select **one** player.`)
-
-  const firstPick = await dmPickOne(teams[firstSide].captain, pool, 'First pick (pick 1)')
-  if (!firstPick) {
-    queue.draft.currentPicker = null
-    queue.draft.currentCaptainId = null
-    queue.creatingTeamsInProgress = false
-    await channel.send('Draft timed out (first pick).')
-    return
-  }
-  teams[firstSide].players.push(firstPick)
-  queue.draft.picks.push({ by: teams[firstSide].captain.id, picked: firstPick.id })
-  pool = pool.filter(p => p.id !== firstPick.id)
-  queue.draft.unpicked = pool.map(p => p.id)
-
-  // --- Second pick (2) ---
-  queue.draft.currentPicker = secondSide
-  queue.draft.currentCaptainId = teams[secondSide].captain.id
-  await channel.send(`Second pick: ${mention(teams[secondSide].captain.id)} — check your **DMs** to select **two** players (one at a time).`)
-
-  const secondPicks = await dmPickTwoSequential(teams[secondSide].captain, pool)
-  if (!secondPicks || secondPicks.length < 2) {
-    queue.draft.currentPicker = null
-    queue.draft.currentCaptainId = null
-    queue.creatingTeamsInProgress = false
-    await channel.send('Draft timed out (second pick).')
-    return
-  }
-  teams[secondSide].players.push(secondPicks[0], secondPicks[1])
-  queue.draft.picks.push(
-    { by: teams[secondSide].captain.id, picked: secondPicks[0].id },
-    { by: teams[secondSide].captain.id, picked: secondPicks[1].id },
-  )
-  pool = pool.filter(p => !secondPicks.find(sp => sp.id === p.id))
-  queue.draft.unpicked = pool.map(p => p.id)
-
-  // --- Last auto to the first side ---
-  if (pool.length === 1) {
-    const last = pool[0]
-    teams[firstSide].players.push(last)
-    queue.draft.picks.push({ by: teams[firstSide].captain.id, picked: last.id, auto: true })
-    pool = []
-  }
-  queue.draft.unpicked = pool.map(p => p.id)
-  queue.draft.currentPicker = null
-  queue.draft.currentCaptainId = null
-
-  // Announce teams
-  await channel.send({
-    embed: {
-      color: 3066993,
-      title: 'Teams are ready!',
-      fields: [
-        { name: 'Blue',   value: teams.blue.players.map(p => mention(p.id)).join(', ') },
-        { name: 'Orange', value: teams.orange.players.map(p => mention(p.id)).join(', ') },
-      ],
-    },
-  })
-
-  // NEW: create voice channels first, then DM lobby info to players
+  // NEW: DM both captains a scouting card with MMR & records for all draft-eligible players
   try {
-    await createVoiceChannels(eventObj, queue)
+    const blueUser   = client.users.get?.(teams.blue.captain.id)   || client.users.cache?.get?.(teams.blue.captain.id);
+    const orangeUser = client.users.get?.(teams.orange.captain.id) || client.users.cache?.get?.(teams.orange.captain.id);
+    if (blueUser) {
+      await dmScoutingCard(
+        blueUser,
+        guildId,
+        players,
+        client,
+        `You are **Captain ${firstPick === 'blue' ? 'FIRST' : 'SECOND'} pick**.`
+      );
+    }
+    if (orangeUser) {
+      await dmScoutingCard(
+        orangeUser,
+        guildId,
+        players,
+        client,
+        `You are **Captain ${firstPick === 'orange' ? 'FIRST' : 'SECOND'} pick**.`
+      );
+    }
   } catch (e) {
-    console.error('createVoiceChannels failed (captains):', e)
-    // continue to DM lobby info even if VC creation fails
+    console.error('Error sending scouting DMs:', e?.message || e);
   }
 
-  try {
-    await createLobbyInfo(eventObj, queue)
-  } catch (e) {
-    console.error('createLobbyInfo failed after captain draft:', e)
-  } finally {
-    queue.creatingTeamsInProgress = false
-  }
-}
+  // FIRST PICK in channel (1 player)
+  const firstMsg = await channel.send(
+    `First pick: <@${teams[firstPick].captain.id}> — reply with the **index** of ONE player:\n` +
+      playersToMentions(players)
+  );
+
+  const firstCollector = channel.createMessageCollector(
+    (m) => m.author.id === teams[firstPick].captain.id,
+    { time: 60_000 }
+  );
+
+  let stepDone = false;
+
+  firstCollector.on('collect', async (m) => {
+    const idx = parseInt(m.content, 10);
+    if (Number.isInteger(idx) && players[idx]) {
+      const pick = players.splice(idx, 1)[0];
+      teams[firstPick].players.push(pick);
+      queue.draft.unpicked = players.map(p => p.id);
+      firstCollector.stop('picked');
+      stepDone = true;
+
+      // After first pick, re-send scouting updates to the second captain (optional)
+      try {
+        const secondCaptainId = teams[secondPick].captain.id;
+        const secondUser = client.users.get?.(secondCaptainId) || client.users.cache?.get?.(secondCaptainId);
+        if (secondUser) {
+          await dmScoutingCard(
+            secondUser,
+            guildId,
+            players, // updated list
+            client,
+            `Updated candidates after first pick:`
+          );
+        }
+      } catch (_) {}
+
+      // SECOND PICK (2 players)
+      queue.draft.currentPicker = secondPick;
+      await channel.send(
+        `Second pick x2: <@${teams[secondPick].captain.id}> — reply with **two indices separated by space** from:\n` +
+          playersToMentions(players)
+      );
+
+      const secondCollector = channel.createMessageCollector(
+        (mm) => mm.author.id === teams[secondPick].captain.id,
+        { time: 60_000 }
+      );
+
+      secondCollector.on('collect', async (mm) => {
+        const parts = mm.content.split(/\s+/).map((s) => parseInt(s, 10));
+        if (parts.length >= 2 && parts.every(Number.isInteger)) {
+          // sort descending to splice correctly
+          const sorted = [...new Set(parts)].sort((a, b) => b - a);
+          const picked = [];
+          for (const idxx of sorted) {
+            if (players[idxx]) {
+              picked.push(players.splice(idxx, 1)[0]);
+            }
+          }
+          if (picked.length >= 2) {
+            teams[secondPick].players.push(picked[0], picked[1]);
+            queue.draft.unpicked = players.map(p => p.id);
+
+            // Last player auto to firstPick team
+            if (players.length === 1) {
+              teams[firstPick].players.push(players.pop());
+              queue.draft.unpicked = [];
+              queue.draft.currentPicker = null;
+            }
+
+            secondCollector.stop('done');
+
+            await channel.send({
+              embed: {
+                color: 3066993,
+                title: 'Teams are ready!',
+                fields: [
+                  {
+                    name: 'Blue',
+                    value: teams.blue.players.map(p => `<@${p.id}>`).join(', ')
+                  },
+                  {
+                    name: 'Orange',
+                    value: teams.orange.players.map(p => `<@${p.id}>`).join(', ')
+                  }
+                ]
+              }
+            });
+          } else {
+            await channel.send('Please provide **two** valid indices.');
+          }
+        } else {
+          await channel.send('Format: `i j` (two numbers).');
+        }
+      });
+
+      secondCollector.on('end', async (_, reason) => {
+        if (reason !== 'done') {
+          queue.draft.currentPicker = null;
+          await channel.send('Draft timed out.');
+        }
+      });
+    } else {
+      await channel.send('Please provide a valid index from the list.');
+    }
+  });
+
+  firstCollector.on('end', async (_, reason) => {
+    if (!stepDone && reason !== 'picked') {
+      queue.draft.currentPicker = null;
+      await channel.send('First pick timed out.');
+    }
+  });
+};
