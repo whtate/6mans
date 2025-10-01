@@ -1,13 +1,10 @@
 // actions/createCaptainTeams.js
 // Captain draft via DM + reactions (1–4). Works in v11–v14.
-// Fixes:
-//  - 1-based numbered choices (no more index confusion)
-//  - Captains pick via reactions in DMs (first picks 1, second picks 2)
-//  - Robust timeouts with clean draft reset
-//  - Calls createLobbyInfo at the end (so the flow actually continues)
-//  - Updates queue.draft/currentCaptainId for !status
+// After teams are finalized, we now create voice channels and then DM lobby details
+// (no public leak of lobby name/password).
 
 const { randomInt } = require('crypto')
+const createVoiceChannels = require('./createVoiceChannels')
 const createLobbyInfo = require('./createLobbyInfo')
 
 function rand(n) {
@@ -27,13 +24,9 @@ function getGuildClient() {
 function getUser(client, id) {
   if (!client) return null
   // v12+
-  if (client.users && client.users.cache && client.users.cache.get) {
-    return client.users.cache.get(id) || null
-  }
+  if (client.users?.cache?.get) return client.users.cache.get(id) || null
   // v11
-  if (client.users && client.users.get) {
-    return client.users.get(id) || null
-  }
+  if (client.users?.get) return client.users.get(id) || null
   return null
 }
 
@@ -42,30 +35,22 @@ function mention(id) {
 }
 
 function listWithNumbers(players) {
-  // players: [{id, username?}]
-  // Show 1-based list for clarity
   return players.map((p, i) => `${i + 1}. ${mention(p.id)}`).join('\n')
 }
 
-// Add numbered reactions 1..N to a message
 async function addDigitReactions(msg, n) {
   for (let i = 0; i < n && i < DIGITS.length; i++) {
     try { /* eslint-disable no-await-in-loop */ await msg.react(DIGITS[i]) } catch {}
   }
 }
 
-// Wait for exactly ONE reaction from a specific user, among allowed emoji
 function awaitOneReaction(msg, userId, allowed, time = PICK_TIMEOUT_MS) {
   return new Promise((resolve) => {
     const filter = (reaction, user) =>
       allowed.includes(reaction.emoji.name) && user.id === userId
-
     const collector = msg.createReactionCollector(filter, { max: 1, time })
     let picked = null
-
-    collector.on('collect', (reaction) => {
-      picked = reaction.emoji.name
-    })
+    collector.on('collect', (reaction) => { picked = reaction.emoji.name })
     collector.on('end', () => resolve(picked))
   })
 }
@@ -153,18 +138,13 @@ module.exports = async (eventObj, queue) => {
   // Helper to DM a captain and get TWO picks via sequential reactions
   const dmPickTwoSequential = async (captain, poolPlayers) => {
     const picks = []
-
-    // First of two
     const first = await dmPickOne(captain, poolPlayers, 'Second pick (1 of 2)')
-    if (!first) return null // timeout
+    if (!first) return null
     picks.push(first)
-
-    // Remove first from pool and ask again
     const remaining = poolPlayers.filter(p => p.id !== first.id)
     const second = await dmPickOne(captain, remaining, 'Second pick (2 of 2)')
-    if (!second) return null // timeout
+    if (!second) return null
     picks.push(second)
-
     return picks
   }
 
@@ -182,7 +162,6 @@ module.exports = async (eventObj, queue) => {
 
   const firstPick = await dmPickOne(teams[firstSide].captain, pool, 'First pick (pick 1)')
   if (!firstPick) {
-    // timeout cleanup
     queue.draft.currentPicker = null
     queue.draft.currentCaptainId = null
     queue.creatingTeamsInProgress = false
@@ -238,11 +217,17 @@ module.exports = async (eventObj, queue) => {
     },
   })
 
-  // Continue the flow just like random teams does
+  // NEW: create voice channels first, then DM lobby info to players
+  try {
+    await createVoiceChannels(eventObj, queue)
+  } catch (e) {
+    console.error('createVoiceChannels failed (captains):', e)
+    // continue to DM lobby info even if VC creation fails
+  }
+
   try {
     await createLobbyInfo(eventObj, queue)
   } catch (e) {
-    // If createLobbyInfo fails for some reason, at least stop "creating" state
     console.error('createLobbyInfo failed after captain draft:', e)
   } finally {
     queue.creatingTeamsInProgress = false
