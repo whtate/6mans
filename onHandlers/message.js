@@ -23,6 +23,7 @@ const {
   registerRemakeVote,
   requiredRemakeVotes,
   resetPlayerQueue,
+  listQueues, // used to show status even if user isn't in a queue
 } = require('../utils/managePlayerQueues')
 
 // Commands map
@@ -67,6 +68,41 @@ function fmtUser(id, username) {
 
 function fmtTeam(list) {
   return list.map(u => `- ${fmtUser(u, null)}`).join('\n')
+}
+
+/**
+ * Delete team voice channels for the given queue.
+ * Version-agnostic for discord.js v11–v14:
+ * - v11: guild.channels.get(id)
+ * - v12+: guild.channels.cache.get(id)
+ */
+async function deleteTeamVoiceChannels(queue, guild) {
+  try {
+    const ids = [
+      queue?.teams?.blue?.voiceChannelID,
+      queue?.teams?.orange?.voiceChannelID,
+    ].filter(Boolean)
+
+    for (const id of ids) {
+      let ch = null
+      try {
+        // v12+ path
+        if (!ch && guild?.channels?.cache?.get) ch = guild.channels.cache.get(id)
+        // v11 path
+        if (!ch && guild?.channels?.get) ch = guild.channels.get(id)
+      } catch (e) {
+        // ignore lookup failures per-channel
+      }
+      if (!ch || typeof ch.delete !== 'function') continue
+      try {
+        await ch.delete('6mans: match reported, cleaning up team voice channels')
+      } catch (e) {
+        console.error('Failed to delete voice channel', id, e && e.message)
+      }
+    }
+  } catch (e) {
+    console.error('deleteTeamVoiceChannels error', e)
+  }
 }
 
 // ---------- handler ----------
@@ -120,11 +156,25 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
     commandToString.playerhistory,
     commandToString.lastmatch, '!lastmatch', '!last-match',
     commandToString.remake,
+
+    // Allow status and votestatus regardless of membership
+    commandToString.status,
+    commandToString.votestatus,
+
+    // Allow kick to pass through so admin override can work
+    commandToString.kick,
   ])
 
   if (isCommand && !queue && validCommandCheck[command] && !nonQueueCommands.has(command)) {
     channel.send(`You have not entered the queue <@${playerId}>. Type ${commandToString.queue} to join!`)
     return
+  }
+
+  // Helper: if user isn't in a queue, pick most recent lobby to show status/votestatus
+  const resolveQueueForView = () => {
+    if (queue) return queue
+    const qs = listQueues(guildId) || []
+    return qs.length ? qs[qs.length - 1] : null
   }
 
   // ------------- switch -------------
@@ -140,13 +190,17 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       leaveQueue(eventObj, queue)
       break
 
-    case commandToString.status:
-      getQueueStatus(eventObj, queue)
+    case commandToString.status: {
+      const q = resolveQueueForView()
+      getQueueStatus(eventObj, q)
       break
+    }
 
-    case commandToString.votestatus:
-      getVoteStatus(eventObj, queue)
+    case commandToString.votestatus: {
+      const q = resolveQueueForView()
+      getVoteStatus(eventObj, q)
       break
+    }
 
     case commandToString.r:
     case commandToString.c:
@@ -158,7 +212,8 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       break
 
     case commandToString.kick:
-      kickPlayer(eventObj, queue)
+      // Now permitted even if not in queue; admin override handled inside action
+      kickPlayer(eventObj, queue || resolveQueueForView() || { players: [], playerIdsIndexed: {}, lobby: { name: 'Lobby' } })
       break
 
     // stats
@@ -226,6 +281,9 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
           lobbyRegion: queue?.lobby?.region || null,
           lobbySeries: queue?.lobby?.series || null,
         })
+
+        // Delete team voice channels now that match is finished
+        await deleteTeamVoiceChannels(queue, eventObj.guild)
 
         clearActiveMatch(queue)
         resetPlayerQueue(queue.lobby.id)

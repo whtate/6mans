@@ -101,7 +101,21 @@ module.exports = async (eventObj, queue) => {
     if (!queue.votingInProgress) return
     queue.votingInProgress = false
     queue._voteTimeout = null
-    channel.send('No decision reached in time. **Lobby auto-disbanded.** Players may queue again.')
+
+    // NEW: mark queue expired so !status can show it
+    queue.status = 'expired'
+    queue.expiresAt = new Date().toISOString()
+
+    // NEW: send a clear expired/disbanded banner
+    channel.send({
+      embed: {
+        color: 15158332, // red
+        title: `Lobby ${lobby?.name || 'Lobby'} — Queue expired`,
+        description: `No decision reached in time. The queue has been **disbanded**. Type **${commandToString.queue || '!q'}** to start a fresh one.`
+      }
+    })
+
+    // keep your original cleanup behavior
     const { deletePlayerQueue } = require('../utils/managePlayerQueues')
     deletePlayerQueue(queue.lobby.id)
   }, VOTE_TIMEOUT_MS)

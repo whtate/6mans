@@ -7,6 +7,10 @@ module.exports = (eventObj, queue) => {
   queue.votingInProgress = false
   queue.creatingTeamsInProgress = true
 
+  // NEW: reflect state for !status / observers
+  queue.draft = null
+  queue.status = 'creating-teams'
+
   // Tell the server that random mode was chosen
   channel.send({
     embed: {

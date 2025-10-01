@@ -25,50 +25,70 @@ module.exports = async (eventObj, queue) => {
       return channel.send('Could not find @everyone role. Check the bot permissions/roles.')
     }
 
-    // --- CREATE BLUE ---
-    // v11 signature: createChannel(name, type, permissionOverwrites, reason)
-    // -> do NOT pass an options object here; set parent/limit after creation
-    const blueVoice = await guild.createChannel(`${lobby.name}-blue`, 'voice')
-    await blueVoice.setParent(parentCategory.id)
-    await blueVoice.setUserLimit(3)
-
-    // Deny for @everyone
-    await blueVoice.overwritePermissions(everyoneRole, {
-      CONNECT: false,
-      SPEAK: false,
-      CREATE_INSTANT_INVITE: false,
-    })
-
-    // Allow for each blue player
-    for (const p of (teams.blue.players || [])) {
-      if (!p || !p.id) continue
-      await blueVoice.overwritePermissions(p.id, {
-        CONNECT: true,
-        SPEAK: true,
+    // Helper to set perms for a team
+    const applyTeamPermissions = async (voiceChan, playersArr = []) => {
+      // Deny for @everyone
+      await voiceChan.overwritePermissions(everyoneRole, {
+        CONNECT: false,
+        SPEAK: false,
+        CREATE_INSTANT_INVITE: false,
       })
+      // Allow for each player on that team
+      for (const p of (playersArr || [])) {
+        if (!p || !p.id) continue
+        await voiceChan.overwritePermissions(p.id, {
+          CONNECT: true,
+          SPEAK: true,
+        })
+      }
+    }
+
+    // --- CREATE BLUE ---
+    // Prefer your original v11 signature: createChannel(name, type)
+    // If unavailable (v12+), fallback to guild.channels.create(name, { type })
+    let blueVoice
+    if (typeof guild.createChannel === 'function') {
+      blueVoice = await guild.createChannel(`${lobby.name}-blue`, 'voice')
+      await blueVoice.setParent(parentCategory.id)
+      await blueVoice.setUserLimit(3)
+      await applyTeamPermissions(blueVoice, teams.blue && teams.blue.players)
+    } else if (guild.channels && typeof guild.channels.create === 'function') {
+      // v12/v13 path
+      blueVoice = await guild.channels.create(`${lobby.name}-blue`, { type: 'GUILD_VOICE' })
+      await blueVoice.setParent(parentCategory.id)
+      await blueVoice.setUserLimit(3)
+      // Permissions API changed names across versions; keep overwritePermissions for your runtime
+      await applyTeamPermissions(blueVoice, teams.blue && teams.blue.players)
+    } else {
+      return channel.send('This Discord.js version is not supported for creating channels.')
     }
 
     // --- CREATE ORANGE ---
-    const orangeVoice = await guild.createChannel(`${lobby.name}-orange`, 'voice')
-    await orangeVoice.setParent(parentCategory.id)
-    await orangeVoice.setUserLimit(3)
-
-    await orangeVoice.overwritePermissions(everyoneRole, {
-      CONNECT: false,
-      SPEAK: false,
-      CREATE_INSTANT_INVITE: false,
-    })
-    for (const p of (teams.orange.players || [])) {
-      if (!p || !p.id) continue
-      await orangeVoice.overwritePermissions(p.id, {
-        CONNECT: true,
-        SPEAK: true,
-      })
+    let orangeVoice
+    if (typeof guild.createChannel === 'function') {
+      orangeVoice = await guild.createChannel(`${lobby.name}-orange`, 'voice')
+      await orangeVoice.setParent(parentCategory.id)
+      await orangeVoice.setUserLimit(3)
+      await applyTeamPermissions(orangeVoice, teams.orange && teams.orange.players)
+    } else if (guild.channels && typeof guild.channels.create === 'function') {
+      orangeVoice = await guild.channels.create(`${lobby.name}-orange`, { type: 'GUILD_VOICE' })
+      await orangeVoice.setParent(parentCategory.id)
+      await orangeVoice.setUserLimit(3)
+      await applyTeamPermissions(orangeVoice, teams.orange && teams.orange.players)
     }
 
     // Save the channel IDs on the queue
     teams.blue.voiceChannelID = blueVoice.id
     teams.orange.voiceChannelID = orangeVoice.id
+
+    // Optional: track simple history stamps if the objects exist (no behavior change)
+    try {
+      const now = Date.now()
+      teams.blue.voiceChannelHistory = teams.blue.voiceChannelHistory || {}
+      teams.orange.voiceChannelHistory = teams.orange.voiceChannelHistory || {}
+      teams.blue.voiceChannelHistory[blueVoice.id] = now
+      teams.orange.voiceChannelHistory[orangeVoice.id] = now
+    } catch (_) { /* non-fatal bookkeeping */ }
 
     // Confirm
     channel.send(

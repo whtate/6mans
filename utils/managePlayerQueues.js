@@ -4,7 +4,7 @@ const playerIdsIndexedToMentions = require('../utils/playerIdsIndexedToMentions'
 const { commandToString } = require('./commands')
 const cloneDeep = require('lodash.clonedeep')
 
-const BRAND  = process.env.lobbyName || 'in-house 6mans'
+const BRAND_PREFIX = process.env.LOBBY_PREFIX || 'swb'       // <-- swb
 const REGION = process.env.lobbyRegion || null
 const SERIES = Number.isFinite(parseInt(process.env.lobbySeries, 10))
   ? parseInt(process.env.lobbySeries, 10)
@@ -17,7 +17,7 @@ const REQUIRED_PLAYERS =
 
 const AUTODISBAND_MS = Number.isFinite(parseInt(process.env.AUTODISBAND_MS, 10))
   ? parseInt(process.env.AUTODISBAND_MS, 10)
-  : (0) // disable old pre-fill disband by default when per-player keepalive is used
+  : 0 // we prefer per-player keepalive
 
 const KEEPALIVE_MS =
   Number.isFinite(parseInt(process.env.KEEPALIVE_MS, 10))
@@ -58,6 +58,13 @@ const queueResetValues = {
   },
   readyToJoin: false,
 
+  // Draft state (for “currently picking captain”)
+  draft: {
+    mode: null,               // 'captains' | 'random' | null
+    currentCaptainId: null,   // user id of the captain currently picking
+    picks: [],                // array of {by: userId, picked: userId}
+  },
+
   // Remake voting
   remakeVotes: 0,
   playersWhoRemakeVoted: {},
@@ -66,22 +73,105 @@ const queueResetValues = {
   _voteTimeout: null,
 }
 
+function queueLabel(prefix, number) {
+  return `${prefix}${number}` // swb1, swb2, …
+}
+
+// announce helper
+function announceToQueueChannel(queue, text) {
+  try {
+    const client = require('../index')
+    const guild  = client.guilds.get(queue.guildId)
+    const chan   = guild && guild.channels.find(ch => ch.type === 'text' && ch.name === process.env.channelName)
+    if (chan) chan.send(text)
+  } catch (e) {
+    console.error('announceToQueueChannel failed', e)
+  }
+}
+
+// keepalive helpers
+async function startKeepAlive(queue, userId) {
+  try {
+    if (!queue.keepAlive) queue.keepAlive = {}
+    cancelKeepAlive(queue, userId)
+
+    const client = require('../index')
+    const user = client.users.get(userId)
+    if (!user) return
+
+    const untilTs = Date.now() + KEEPALIVE_MS
+    const warnDelay = Math.max(untilTs - Date.now() - KEEPALIVE_WARN_MS, 0)
+    const kickDelay = Math.max(untilTs - Date.now(), 0)
+
+    const warnTO = setTimeout(async () => {
+      try {
+        const dm = await user.send(
+          `⏳ You’ve been in **${queue.lobby.name}** for almost an hour.\n` +
+          `React with ✅ in the next **${Math.round(KEEPALIVE_WARN_MS/60000)} minutes** to **stay in the queue for another hour**.\n\n` +
+          `If you don’t react, you’ll be removed.`
+        )
+        await dm.react('✅')
+        const filter = (reaction, reactor) => reaction.emoji.name === '✅' && reactor.id === userId
+        const collector = dm.createReactionCollector(filter, { time: KEEPALIVE_WARN_MS })
+        let extended = false
+        collector.on('collect', () => { extended = true; collector.stop('extended') })
+        collector.on('end', () => {
+          if (extended && queue.playerIdsIndexed[userId]) {
+            cancelKeepAlive(queue, userId)
+            startKeepAlive(queue, userId)
+            user.send('✅ Got it — you’ll **stay in the queue for another hour**.')
+          }
+        })
+      } catch (e) { console.error('keepalive warn DM failed', e) }
+    }, warnDelay)
+
+    const kickTO = setTimeout(() => {
+      try {
+        if (queue.playerIdsIndexed[userId]) {
+          delete queue.playerIdsIndexed[userId]
+          if (Array.isArray(queue.players)) queue.players = queue.players.filter(p => p.id !== userId)
+          announceToQueueChannel(queue, `⌛ <@${userId}> was **removed from the queue** (inactive).`)
+          const client = require('../index')
+          const user = client.users.get(userId)
+          if (user) user.send(`You were removed from **${queue.lobby.name}** due to inactivity. You can **!q** again anytime.`)
+        }
+      } catch (e) { console.error('keepalive kick failed', e) }
+      finally { cancelKeepAlive(queue, userId) }
+    }, kickDelay)
+
+    queue.keepAlive[userId] = { warnTO, kickTO, untilTs }
+  } catch (e) { console.error('startKeepAlive failed', e) }
+}
+
+function cancelKeepAlive(queue, userId) {
+  if (!queue || !queue.keepAlive || !queue.keepAlive[userId]) return
+  const { warnTO, kickTO } = queue.keepAlive[userId]
+  if (warnTO) clearTimeout(warnTO)
+  if (kickTO) clearTimeout(kickTO)
+  delete queue.keepAlive[userId]
+}
+
+function cancelAllKeepAlive(queue) {
+  if (!queue || !queue.keepAlive) return
+  for (const uid of Object.keys(queue.keepAlive)) cancelKeepAlive(queue, uid)
+}
+
 function createQueue(guildId) {
   const state = getGuildState(guildId)
   const number = state.nextLobbyNumber++
   const lobbyId = ++globalLobbyId
+  const label = queueLabel(BRAND_PREFIX, number)
 
   const queue = {
     guildId: guildId || null,
     lobby: {
       id: lobbyId,
       number,
-      label: `Lobby #${number}`,
-      name: `${BRAND} — Lobby #${number}`,
-      brand: BRAND,
+      label, // "swb1"
+      name: label, // channel-visible name stays "swb1"
+      brand: BRAND_PREFIX,
       region: REGION,
       series: SERIES,
-      // digits-only code avoids accidental words
       password: randomstring.generate({ length: 4, charset: '23456789' }),
     },
 
@@ -89,23 +179,21 @@ function createQueue(guildId) {
     playerIdsIndexed: {},
     ...cloneDeep(queueResetValues),
 
-    activeMatch: null,    // { teamAIds, teamBIds } once teams are formed
+    activeMatch: null,
     createdAt: Date.now(),
 
-    // old queue-level timers (kept for compatibility)
     autoDisbandTimer: null,
-
-    // NEW: per-player keepalive structure
-    keepAlive: {
-      // [userId]: { warnTO, kickTO, untilTs }
-    },
+    keepAlive: {},
   }
 
-  // (Optional) legacy pre-fill disband (disabled by default)
   if (AUTODISBAND_MS > 0) {
     queue.autoDisbandTimer = setTimeout(() => {
       const count = Object.keys(queue.playerIdsIndexed).length
       if (count < REQUIRED_PLAYERS && !queue.votingInProgress && !queue.activeMatch) {
+        // NEW: mark expired for status visibility just before removal
+        queue.status = 'expired'
+        queue.expiresAt = new Date().toISOString()
+        announceToQueueChannel(queue, `🕓 **${queue.lobby.name}** expired due to inactivity. You can **!q** again.`)
         deletePlayerQueue(queue.lobby.id)
       }
     }, AUTODISBAND_MS)
@@ -116,11 +204,9 @@ function createQueue(guildId) {
 }
 
 function listQueues(guildId) { return getGuildState(guildId).queues }
-
 function findPlayersQueue(guildId, userId) {
   return listQueues(guildId).find(q => q.playerIdsIndexed[userId]) || null
 }
-
 function findJoinableQueue(guildId) {
   const open = listQueues(guildId)
     .filter(q => !q.votingInProgress && !q.activeMatch && Object.keys(q.playerIdsIndexed).length < REQUIRED_PLAYERS)
@@ -135,12 +221,9 @@ function findJoinableQueue(guildId) {
 
 function determinePlayerQueue(playerId, command, guildId) {
   const state = getGuildState(guildId)
-
-  // If already in a queue, use it
   const playersQueue = findPlayersQueue(guildId, playerId)
   if (playersQueue) return playersQueue
 
-  // Only create/assign on join
   if (command !== commandToString.queue) {
     if (state.queues.length === 0) return undefined
     return null
@@ -151,144 +234,29 @@ function determinePlayerQueue(playerId, command, guildId) {
   return createQueue(guildId)
 }
 
-// Helper: announce in the queue text channel (best-effort)
-function announceToQueueChannel(queue, text) {
-  try {
-    const client = require('../index')
-    const guild  = client.guilds.get(queue.guildId)
-    const chan   = guild && guild.channels.find(ch => ch.type === 'text' && ch.name === process.env.channelName)
-    if (chan) chan.send(text)
-  } catch (e) {
-    console.error('announceToQueueChannel failed', e)
-  }
-}
-
-// ---- NEW: per-player keepalive management ----
-async function startKeepAlive(queue, userId) {
-  try {
-    if (!queue.keepAlive) queue.keepAlive = {}
-    // clear any existing timers first
-    cancelKeepAlive(queue, userId)
-
-    const client = require('../index')
-    const user = client.users.get(userId)
-    if (!user) return
-
-    const untilTs = Date.now() + KEEPALIVE_MS
-    const warnDelay = Math.max(untilTs - Date.now() - KEEPALIVE_WARN_MS, 0)
-    const kickDelay = Math.max(untilTs - Date.now(), 0)
-
-    // Schedule warning DM
-    const warnTO = setTimeout(async () => {
-      try {
-        const dm = await user.send(
-          `⏳ You’ve been in **${queue.lobby.name}** for almost an hour.\n` +
-          `React with ✅ in the next **${Math.round(KEEPALIVE_WARN_MS/60000)} minutes** to **stay in the queue for another hour**.\n\n` +
-          `If you don’t react, you’ll be removed.`
-        )
-        await dm.react('✅')
-
-        // v11 reaction collector
-        const filter = (reaction, reactor) => reaction.emoji.name === '✅' && reactor.id === userId
-        const collector = dm.createReactionCollector(filter, { time: KEEPALIVE_WARN_MS })
-
-        let extended = false
-        collector.on('collect', () => {
-          extended = true
-          collector.stop('extended')
-        })
-
-        collector.on('end', (collected, reason) => {
-          if (reason === 'extended' && extended) {
-            // player opted to stay: reset for another hour
-            // only if they are STILL in this queue
-            if (queue.playerIdsIndexed[userId]) {
-              // reschedule fresh window
-              cancelKeepAlive(queue, userId)
-              startKeepAlive(queue, userId)
-              user.send('✅ Got it — you’ll **stay in the queue for another hour**.')
-            }
-          }
-        })
-      } catch (e) {
-        console.error('keepalive warn DM failed', e)
-      }
-    }, warnDelay)
-
-    // Schedule kick removal
-    const kickTO = setTimeout(() => {
-      try {
-        // If user is still in this queue AND didn’t extend, remove them
-        if (queue.playerIdsIndexed[userId]) {
-          // remove from queue
-          delete queue.playerIdsIndexed[userId]
-          if (Array.isArray(queue.players)) {
-            queue.players = queue.players.filter(p => p.id !== userId)
-          }
-          announceToQueueChannel(queue, `⌛ <@${userId}> was **removed from the queue** (inactive).`)
-          // DM them
-          user.send(`You were removed from **${queue.lobby.name}** due to inactivity. You can **!q** again anytime.`)
-        }
-      } catch (e) {
-        console.error('keepalive kick failed', e)
-      } finally {
-        cancelKeepAlive(queue, userId)
-      }
-    }, kickDelay)
-
-    queue.keepAlive[userId] = { warnTO, kickTO, untilTs }
-  } catch (e) {
-    console.error('startKeepAlive failed', e)
-  }
-}
-
-function cancelKeepAlive(queue, userId) {
-  if (!queue || !queue.keepAlive || !queue.keepAlive[userId]) return
-  const { warnTO, kickTO } = queue.keepAlive[userId]
-  if (warnTO) clearTimeout(warnTO)
-  if (kickTO) clearTimeout(kickTO)
-  delete queue.keepAlive[userId]
-}
-
-function cancelAllKeepAlive(queue) {
-  if (!queue || !queue.keepAlive) return
-  for (const uid of Object.keys(queue.keepAlive)) {
-    cancelKeepAlive(queue, uid)
-  }
-}
-
 // When teams/VCs are created, call this so players are free to re-queue
 function registerActiveMatch(queue, teamAIds, teamBIds) {
   queue.activeMatch = { teamAIds: [...teamAIds], teamBIds: [...teamBIds] }
   queue.votingInProgress = false
   queue.creatingTeamsInProgress = false
 
-  // Cancel auto-disband + vote timers; match is in progress
   if (queue.autoDisbandTimer) { clearTimeout(queue.autoDisbandTimer); queue.autoDisbandTimer = null }
   if (queue._voteTimeout)     { clearTimeout(queue._voteTimeout);     queue._voteTimeout = null }
-
-  // Cancel per-player keepalive while they play
   cancelAllKeepAlive(queue)
 
-  // Free players from queue (so they can join another queue immediately if they want after)
   const state = getGuildState(queue.guildId)
   for (const id of [...teamAIds, ...teamBIds]) {
     delete queue.playerIdsIndexed[id]
-    if (queue.players?.length) {
-      queue.players = queue.players.filter(p => (p.id || p) !== id)
-    }
+    if (queue.players?.length) queue.players = queue.players.filter(p => (p.id || p) !== id)
     state.activeByPlayer.set(id, queue)
   }
 }
 
-// After match is reported or lobby is remade, clear the active mapping
 function clearActiveMatch(queue) {
   const state = getGuildState(queue.guildId)
   if (queue.activeMatch) {
     for (const id of [...queue.activeMatch.teamAIds, ...queue.activeMatch.teamBIds]) {
-      if (state.activeByPlayer.get(id) === queue) {
-        state.activeByPlayer.delete(id)
-      }
+      if (state.activeByPlayer.get(id) === queue) state.activeByPlayer.delete(id)
     }
   }
   queue.activeMatch = null
@@ -307,7 +275,6 @@ function deletePlayerQueue(lobbyId) {
       if (q.autoDisbandTimer) clearTimeout(q.autoDisbandTimer)
       if (q._voteTimeout)     clearTimeout(q._voteTimeout)
       cancelAllKeepAlive(q)
-      // clear active index
       if (q.activeMatch) {
         for (const id of [...q.activeMatch.teamAIds, ...q.activeMatch.teamBIds]) {
           if (state.activeByPlayer.get(id) === q) state.activeByPlayer.delete(id)
@@ -319,7 +286,6 @@ function deletePlayerQueue(lobbyId) {
   }
 }
 
-// Fully clear players & indices so users can requeue after remake
 function resetPlayerQueue(lobbyId) {
   for (const [, state] of guildStates) {
     const idx = state.queues.findIndex(q => q.lobby.id === lobbyId)
@@ -335,18 +301,20 @@ function resetPlayerQueue(lobbyId) {
       lobby: q.lobby,
       createdAt: Date.now(),
     }
-    // wipe players & state entirely
     const fresh = Object.assign({}, preserved, cloneDeep(queueResetValues))
     fresh.players = []
     fresh.playerIdsIndexed = {}
     fresh.activeMatch = null
     fresh.keepAlive = {}
 
-    // optional legacy pre-fill timer
     if (AUTODISBAND_MS > 0) {
       fresh.autoDisbandTimer = setTimeout(() => {
         const count = Object.keys(fresh.playerIdsIndexed).length
         if (count < REQUIRED_PLAYERS && !fresh.votingInProgress && !fresh.activeMatch) {
+          // NEW: mark expired for status visibility just before removal
+          fresh.status = 'expired'
+          fresh.expiresAt = new Date().toISOString()
+          announceToQueueChannel(fresh, `🕓 **${fresh.lobby.name}** expired due to inactivity. You can **!q** again.`)
           deletePlayerQueue(fresh.lobby.id)
         }
       }, AUTODISBAND_MS)
@@ -367,13 +335,11 @@ function kickPlayer(playerIndex, queue, messageChannel) {
   if (messageChannel) {
     messageChannel(`<@${playerId}> has been kicked. You can check the lobby status with ${commandToString.status}`)
   }
-  // do not reset whole lobby; keep others
 }
 
 function removeOfflinePlayerFromQueue({ playerId, playerChannels, guildId }) {
   let playersQueue = findPlayersQueue(guildId, playerId)
   if (!playersQueue) {
-    // If player is in an active match, ignore (they're not in queue)
     const state = getGuildState(guildId)
     if (state.activeByPlayer.get(playerId)) return
     return
@@ -384,8 +350,11 @@ function removeOfflinePlayerFromQueue({ playerId, playerChannels, guildId }) {
   cancelKeepAlive(playersQueue, playerId)
 
   const channel = playerChannels.find(ch => ch.name === process.env.channelName)
-
   if (Object.keys(playersQueue.playerIdsIndexed).length === 0) {
+    // NEW: mark expired since the queue is being disbanded due to everyone leaving
+    playersQueue.status = 'expired'
+    playersQueue.expiresAt = new Date().toISOString()
+    announceToQueueChannel(playersQueue, `🕓 **${playersQueue.lobby.name}** expired (everyone left).`)
     deletePlayerQueue(playersQueue.lobby.id)
   } else if (channel) {
     channel.send({
@@ -412,7 +381,7 @@ function registerRemakeVote(queue, voterId) {
 }
 
 function requiredRemakeVotes() {
-  return Math.ceil(REQUIRED_PLAYERS / 2)  // simple majority
+  return Math.ceil(REQUIRED_PLAYERS / 2)
 }
 
 module.exports = {
@@ -422,19 +391,16 @@ module.exports = {
   kickPlayer,
   resetPlayerQueue,
 
-  // Active match flow
   registerActiveMatch,
   clearActiveMatch,
   findActiveMatchQueueByPlayer,
 
-  // Remake
   registerRemakeVote,
   requiredRemakeVotes,
 
-  // Optional helpers
   listQueues,
 
-  // Keepalive exports
+  // keepalive
   startKeepAlive,
   cancelKeepAlive,
   cancelAllKeepAlive,

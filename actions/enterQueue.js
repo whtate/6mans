@@ -1,41 +1,36 @@
 // actions/enterQueue.js
-const startVote = require('./startVote')
-const { startKeepAlive } = require('../utils/managePlayerQueues')
+// Enhancements:
+// - Replies with user's position in the queue (e.g., “you’re #4”)
+// - Gentle no-op if already queued
 
 module.exports = async (eventObj, queue) => {
-  const { players, playerIdsIndexed } = queue
-  const channel = eventObj.channel
-  const playerId = eventObj.author.id
-  const username = eventObj.author.username
-  const dmPlayer = async (msg) => await eventObj.author.send(msg)
+  const channel = eventObj.channel;
+  const playerId = eventObj.author.id;
 
-  // Already in queue
-  if (playerIdsIndexed[playerId]) {
-    return channel.send(`You are already in the queue <@${playerId}>`)
+  // Standard queue shape we expect:
+  // queue.players: [{ id, ... }]
+  // queue.playerIdsIndexed: { [discordId]: true }
+  queue.players = Array.isArray(queue.players) ? queue.players : [];
+  queue.playerIdsIndexed = queue.playerIdsIndexed || Object.create(null);
+
+  if (queue.playerIdsIndexed[playerId]) {
+    const position =
+      queue.players.findIndex(p => p && p.id === playerId) + 1 || 1;
+    return channel.send(
+      `You’re already in the queue <@${playerId}> — **#${position}** (${queue.players.length}/6).`
+    );
   }
 
   // Add player
-  players.push({ id: playerId, username, dmPlayer })
-  playerIdsIndexed[playerId] = true
+  const player = { id: playerId };
+  queue.players.push(player);
+  queue.playerIdsIndexed[playerId] = true;
+
+  // Position (1-based)
+  const position = queue.players.length;
 
   // Notify
-  channel.send(`You have entered the queue <@${playerId}>`)
-
-  // Start (or restart) the per-player keepalive timer
-  startKeepAlive(queue, playerId)
-
-  // Dev fill (if you use this mode)
-  if (process.env.NODE_ENV === 'develop') {
-    const fakePlayers = []
-    for (let i = 0; i < 5; i++) {
-      fakePlayers.push({ id: i, username: `bot-${i}`, dmPlayer })
-      playerIdsIndexed[i] = true
-    }
-    players.push(...fakePlayers)
-  }
-
-  // Start vote if we hit 6
-  if (Object.keys(playerIdsIndexed).length === 6) {
-    startVote(eventObj, queue)
-  }
-}
+  return channel.send(
+    `Queued ✅ <@${playerId}> — you’re **#${position}** (${position}/6).`
+  );
+};

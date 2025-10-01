@@ -50,10 +50,17 @@ module.exports = async (eventObj, queue) => {
       clearTimeout(queue._voteTimeout)
       queue._voteTimeout = null
     }
+
     if (mode === 'r') {
+      // NEW: clear any stale draft state and optionally indicate we're creating teams
+      queue.draft = null
+      queue.status = 'creating-teams' // informational only; won't break existing flows
       await channel.send('**Random teams** selected by vote.')
       return createRandomTeams(eventObj, queue)
     } else {
+      // NEW: seed a minimal draft state so !status can show "Currently picking"
+      queue.draft = queue.draft || { mode: 'captains', currentCaptainId: null, picks: [] }
+      queue.status = 'drafting'
       await channel.send('**Captains** selected by vote.')
       return createCaptainTeams(eventObj, queue)
     }

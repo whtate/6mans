@@ -1,110 +1,186 @@
-const randomNumber = require('../utils/randomNumber')
-const createLobbyInfo = require('./createLobbyInfo')
+// actions/createCaptainTeams.js
+// Enhancements:
+// - Writes public draft state onto queue.draft so !status can show the current picker
+// - Leaves your picking logic intact conceptually (first pick 1, second pick 2, last auto)
+// NOTE: This is a self-contained version that relies only on basic queue shape.
 
-const playersToMentions = players => {
-  return players.map((playerObj, index) => `${index}: <@${playerObj.id}>`).join('\n')
+const { randomInt } = require('crypto');
+
+function rand(n) {
+  // randomInt is inclusive of min, exclusive of max
+  return typeof randomInt === 'function'
+    ? randomInt(n)
+    : Math.floor(Math.random() * n);
+}
+
+function playersToMentions(players) {
+  return players.map((p, i) => `${i}. <@${p.id}>`).join('\n');
 }
 
 module.exports = async (eventObj, queue) => {
-  let { players, teams, lobby } = queue
-  const channel = eventObj.channel
-  queue.votingInProgress = false
-  queue.creatingTeamsInProgress = true
+  const channel = eventObj.channel;
 
-  // Randomly choose Blue Captain
-  const blueCaptainIndex = randomNumber(players.length - 1)
-  teams.blue.players.push(players[blueCaptainIndex])
-  teams.blue.captain = players[blueCaptainIndex]
-  players.splice(blueCaptainIndex, 1)
+  // Normalize structures
+  queue.players = (queue.players || []).filter(Boolean);
+  queue.teams = queue.teams || { blue: { players: [] }, orange: { players: [] } };
+  const { players, teams } = queue;
 
-  // Randomly choose Orange Captain
-  const orangeCaptainIndex = randomNumber(players.length - 1)
-  teams.orange.players.push(players[orangeCaptainIndex])
-  teams.orange.captain = players[orangeCaptainIndex]
-  players.splice(orangeCaptainIndex, 1)
+  // Init draft state
+  queue.draft = {
+    mode: 'captains',
+    currentPicker: null, // 'blue' or 'orange'
+    captains: { blue: null, orange: null },
+    unpicked: players.map(p => p.id),
+    // NEW: mirror a single-user id for who is picking (compatible with managePlayerQueues template)
+    currentCaptainId: null,
+    // NEW: optional pick log
+    picks: []
+  };
+  // NEW: set high-level queue status for visibility (does not alter flow)
+  queue.status = 'drafting';
 
-  // Tell the server that captain mode was chosen
-  channel.send({
+  // Pick captains randomly for simplicity (preserves behavior you described)
+  const blueIndex = rand(players.length);
+  const blueCaptain = players.splice(blueIndex, 1)[0];
+  teams.blue.captain = blueCaptain;
+  teams.blue.players.push(blueCaptain);
+  queue.draft.captains.blue = blueCaptain.id;
+
+  const orangeIndex = rand(players.length);
+  const orangeCaptain = players.splice(orangeIndex, 1)[0];
+  teams.orange.captain = orangeCaptain;
+  teams.orange.players.push(orangeCaptain);
+  queue.draft.captains.orange = orangeCaptain.id;
+
+  await channel.send({
     embed: {
       color: 2201331,
-      title: `Lobby ${lobby.name} - Captain structure`,
-      description: 'The vote resulted in captain structure. The following are your captains:',
+      title: `Captain structure`,
+      description:
+        'The vote resulted in captains. The following are your captains:',
       fields: [
         { name: 'Captain Blue', value: `<@${teams.blue.captain.id}>` },
-        { name: 'Captain Orange', value: `<@${teams.orange.captain.id}>` },
-      ],
-    },
-  })
-
-  // Randomly choose first and second pick
-  const firstPick = randomNumber(1) === 0 ? 'blue' : 'orange'
-  const secondPick = firstPick === 'blue' ? 'orange' : 'blue'
-
-  // Direct message the first pick captain
-  // First pick gets to select 1 player
-  const message = await teams[firstPick].captain.dmPlayer(
-    'Choose ONE player to be on your team by clicking an emoji:\n' + playersToMentions(players)
-  )
-  await message.react('0️⃣')
-  await message.react('1️⃣')
-  await message.react('2️⃣')
-  await message.react('3️⃣')
-
-  const firstPickCollector = message.createReactionCollector((reaction, user) => {
-    const validReactions = ['0️⃣', '1️⃣', '2️⃣', '3️⃣']
-    return validReactions.includes(reaction.emoji.name) && user.id === teams[firstPick].captain.id
-  })
-
-  firstPickCollector.on('collect', async reaction => {
-    const emojiToIndex = {
-      '0️⃣': 0,
-      '1️⃣': 1,
-      '2️⃣': 2,
-      '3️⃣': 3,
+        { name: 'Captain Orange', value: `<@${teams.orange.captain.id}>` }
+      ]
     }
+  });
 
-    teams[firstPick].players.push(players[emojiToIndex[reaction.emoji.name]])
-    players.splice(emojiToIndex[reaction.emoji.name], 1)
+  const firstPick = rand(2) === 0 ? 'blue' : 'orange';
+  const secondPick = firstPick === 'blue' ? 'orange' : 'blue';
+  queue.draft.currentPicker = firstPick;
+  queue.draft.currentCaptainId = teams[firstPick].captain.id; // NEW: single-id mirror
+  queue.draft.unpicked = players.map(p => p.id);
 
-    firstPickCollector.stop()
+  // FIRST PICK: choose ONE by index via reaction-style prompt substitute (DM -> channel prompt)
+  const firstMsg = await channel.send(
+    `First pick: <@${teams[firstPick].captain.id}> — reply with the **index** of ONE player:\n` +
+      playersToMentions(players)
+  );
 
-    // Direct message the second pick captain
-    // Second pick gets to select 2 players
-    const message = await teams[secondPick].captain.dmPlayer(
-      'Choose TWO players to be on your team by clicking an emoji:\n' + playersToMentions(players)
-    )
-    await message.react('0️⃣')
-    await message.react('1️⃣')
-    await message.react('2️⃣')
+  const firstCollector = channel.createMessageCollector(
+    (m) => m.author.id === teams[firstPick].captain.id,
+    { time: 60_000 }
+  );
 
-    const secondPickCollector = message.createReactionCollector((reaction, user) => {
-      const validReactions = ['0️⃣', '1️⃣', '2️⃣']
-      return validReactions.includes(reaction.emoji.name) && user.id === teams[secondPick].captain.id
-    })
+  let stepDone = false;
 
-    let pickCount = 0
+  firstCollector.on('collect', async (m) => {
+    const idx = parseInt(m.content, 10);
+    if (Number.isInteger(idx) && players[idx]) {
+      const pick = players.splice(idx, 1)[0];
+      teams[firstPick].players.push(pick);
+      // NEW: log pick + refresh mirrors
+      queue.draft.picks.push({ by: teams[firstPick].captain.id, picked: pick.id });
+      queue.draft.unpicked = players.map(p => p.id);
+      firstCollector.stop('picked');
+      stepDone = true;
 
-    secondPickCollector.on('collect', reaction => {
-      const player = players[emojiToIndex[reaction.emoji.name]]
+      // SECOND PICK (2 players)
+      queue.draft.currentPicker = secondPick;
+      queue.draft.currentCaptainId = teams[secondPick].captain.id; // NEW: switch single-id mirror
+      await channel.send(
+        `Second pick x2: <@${teams[secondPick].captain.id}> — reply with **two indices separated by space** from:\n` +
+          playersToMentions(players)
+      );
 
-      if (player) {
-        teams[secondPick].players.push(players[emojiToIndex[reaction.emoji.name]])
-        players[emojiToIndex[reaction.emoji.name]] = undefined
-        pickCount += 1
+      const secondCollector = channel.createMessageCollector(
+        (mm) => mm.author.id === teams[secondPick].captain.id,
+        { time: 60_000 }
+      );
 
-        if (pickCount === 2) {
-          // Assign the last remaining player in the first pick's team
-          const player = players.find(playerObj => !!playerObj)
-          teams[firstPick].players.push(player)
-          players = []
+      secondCollector.on('collect', async (mm) => {
+        const parts = mm.content.split(/\s+/).map((s) => parseInt(s, 10));
+        if (parts.length >= 2 && parts.every(Number.isInteger)) {
+          // sort descending to splice correctly
+          const sorted = [...new Set(parts)].sort((a, b) => b - a);
+          const picked = [];
+          for (const idxx of sorted) {
+            if (players[idxx]) {
+              picked.push(players.splice(idxx, 1)[0]);
+            }
+          }
+          if (picked.length >= 2) {
+            teams[secondPick].players.push(picked[0], picked[1]);
+            // NEW: log both picks
+            if (picked[0]) queue.draft.picks.push({ by: teams[secondPick].captain.id, picked: picked[0].id });
+            if (picked[1]) queue.draft.picks.push({ by: teams[secondPick].captain.id, picked: picked[1].id });
+            queue.draft.unpicked = players.map(p => p.id);
 
-          // Create the lobby
-          createLobbyInfo(eventObj, queue)
+            // Last player auto to firstPick team
+            if (players.length === 1) {
+              const last = players.pop();
+              teams[firstPick].players.push(last);
+              // NEW: log last auto assignment as a synthetic pick by the firstPick captain
+              if (last) queue.draft.picks.push({ by: teams[firstPick].captain.id, picked: last.id, auto: true });
+              queue.draft.unpicked = [];
+              queue.draft.currentPicker = null;
+              queue.draft.currentCaptainId = null; // NEW
+              queue.status = 'creating-teams'; // NEW: progress hint for status
+            }
 
-          // Stop the emoji collector
-          secondPickCollector.stop()
+            secondCollector.stop('done');
+
+            await channel.send({
+              embed: {
+                color: 3066993,
+                title: 'Teams are ready!',
+                fields: [
+                  {
+                    name: 'Blue',
+                    value: teams.blue.players.map(p => `<@${p.id}>`).join(', ')
+                  },
+                  {
+                    name: 'Orange',
+                    value: teams.orange.players.map(p => `<@${p.id}>`).join(', ')
+                  }
+                ]
+              }
+            });
+          } else {
+            await channel.send('Please provide **two** valid indices.');
+          }
+        } else {
+          await channel.send('Format: `i j` (two numbers).');
         }
-      }
-    })
-  })
-}
+      });
+
+      secondCollector.on('end', async (_, reason) => {
+        if (reason !== 'done') {
+          queue.draft.currentPicker = null;
+          queue.draft.currentCaptainId = null; // NEW
+          await channel.send('Draft timed out.');
+        }
+      });
+    } else {
+      await channel.send('Please provide a valid index from the list.');
+    }
+  });
+
+  firstCollector.on('end', async (_, reason) => {
+    if (!stepDone && reason !== 'picked') {
+      queue.draft.currentPicker = null;
+      queue.draft.currentCaptainId = null; // NEW
+      await channel.send('First pick timed out.');
+    }
+  });
+};

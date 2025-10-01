@@ -27,6 +27,9 @@ exports.commandToString = {
 
   // Remake vote
   remake: '!remake',
+
+  // NEW: Admin prune command (delete users not in the server anymore)
+  pruneusers: '!prune_users',
 }
 
 // All strings that the bot should accept (aliases)
@@ -64,4 +67,9 @@ exports.validCommandCheck = {
 
   // remake vote
   '!remake': true,
+
+  // NEW: admin prune command aliases
+  '!prune_users': true,         // primary
+  '!pruneusers': true,          // alias
+  '!prune': true,               // short alias
 }

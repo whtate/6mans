@@ -352,6 +352,68 @@ async function getLastMatches({ guildId, limit = 5 }) {
   return rows;
 }
 
+/* ===========================
+   NEW HELPERS (non-breaking)
+   =========================== */
+
+/**
+ * Apply a sub-out penalty (e.g., -15 MMR) and record it in mmr_history.
+ * Uses match_id = 0 to indicate a system adjustment, not a real match row.
+ *
+ * @param {Object} params
+ * @param {string} params.guildId
+ * @param {string} params.subOutUserId
+ * @param {number} [params.amount=15] positive number; will be subtracted from MMR
+ */
+async function applySubPenalty({ guildId, subOutUserId, amount = 15 }) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Deduct MMR
+    await client.query(
+      `UPDATE players SET mmr = mmr - $1 WHERE guild_id=$2 AND user_id=$3`,
+      [amount, guildId, subOutUserId]
+    );
+    // Record an auditable history row
+    await client.query(
+      `INSERT INTO mmr_history (guild_id, user_id, match_id, win, delta)
+       VALUES ($1,$2,$3,$4,$5)`,
+      [guildId, subOutUserId, 0, false, -amount]
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Delete players from the database who are no longer in the guild.
+ * Pass the list of user IDs that are still present; everyone else is pruned.
+ *
+ * @param {Object} params
+ * @param {string} params.guildId
+ * @param {string[]} params.aliveIds
+ * @returns {number} count of deleted rows
+ */
+async function pruneUsersNotIn({ guildId, aliveIds }) {
+  if (!Array.isArray(aliveIds)) throw new Error('aliveIds must be an array of user IDs');
+  const { rows } = await pool.query(
+    `SELECT user_id FROM players WHERE guild_id=$1`,
+    [guildId]
+  );
+  const keep = new Set(aliveIds);
+  const stale = rows.map(r => r.user_id).filter(id => !keep.has(id));
+  if (stale.length === 0) return 0;
+  await pool.query(
+    `DELETE FROM players WHERE guild_id=$1 AND user_id = ANY($2)`,
+    [guildId, stale]
+  );
+  return stale.length;
+}
+
 module.exports = {
   pool,
   init,
@@ -363,4 +425,7 @@ module.exports = {
   getLobbyHistory,
   getUserHistory,
   getLastMatches,
+  // NEW exports
+  applySubPenalty,
+  pruneUsersNotIn,
 };
