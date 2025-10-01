@@ -1,19 +1,50 @@
 // actions/createCaptainTeams.js
-// Reaction-based captain draft in **DMs**, with per-player scouting cards.
-// Fixes: use the global client to fetch User objects (not GuildMember) so DMs work
-// even without privileged member intents. Also keeps queue.draft currentPicker so
-// !status can show who's picking. Creates voice channels after teams finalize.
+// Reaction-based captain draft in DMs, with per-player scouting cards.
+// v11 DM fix: use a compat user fetcher (client.users.get or client.fetchUser)
+// Adds explicit "queue expired" banner on 7-minute pick timeouts.
+// Creates voice channels when teams finalize.
 
 const { getStats, upsertPlayer } = require('../db')
 const createVoiceChannels = require('./createVoiceChannels')
 
-// 7 minutes per pick step
+// 7 minutes per pick step (user request)
 const PICK_TIMEOUT_MS = 7 * 60 * 1000
 
 const NUM_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣'] // supports up to 4 draft-eligible
 
 function randInt(n) { return Math.floor(Math.random() * n) }
 function fmtDelta(n) { const v = Number(n) || 0; return `${v >= 0 ? '+' : ''}${v}` }
+
+// ----- v11-compatible user fetch -----
+async function fetchUserCompat(client, id) {
+  // v11: client.users.get(id) exists; client.fetchUser(id) fetches from API.
+  try {
+    if (client.users && typeof client.users.get === 'function') {
+      const u = client.users.get(id)
+      if (u) return u
+    }
+  } catch (_) {}
+  try {
+    if (typeof client.fetchUser === 'function') {
+      const u = await client.fetchUser(id)
+      if (u) return u
+    }
+  } catch (_) {}
+  // v12+ fallback if the project ever upgrades
+  try {
+    if (client.users?.cache?.get) {
+      const u = client.users.cache.get(id)
+      if (u) return u
+    }
+  } catch (_) {}
+  try {
+    if (client.users?.fetch) {
+      const u = await client.users.fetch(id)
+      if (u) return u
+    }
+  } catch (_) {}
+  return null
+}
 
 async function statsLine(guildId, userId, fallbackName) {
   let mmr = 1000, w = 0, l = 0, month = 0
@@ -34,9 +65,14 @@ async function buildScoutingCard(guild, candidates) {
   const lines = []
   for (let i = 0; i < candidates.length; i++) {
     const p = candidates[i]
-    const mem = guild?.members?.cache?.get?.(p.id)
+    let uname = p.username || null
+    try {
+      const mem = guild?.members?.cache?.get?.(p.id)
                 || (guild?.members?.fetch ? await guild.members.fetch(p.id).catch(()=>null) : null)
-    const uname = mem?.user?.username || p.username || String(p.id)
+      uname = mem?.user?.username || uname || String(p.id)
+    } catch (_) {
+      uname = uname || String(p.id)
+    }
     try { await upsertPlayer({ guildId, userId: p.id, username: uname }) } catch {}
     const s = await statsLine(guildId, p.id, uname)
     lines.push(`**${i + 1}.** <@${p.id}> — MMR **${s.mmr}** — W/L **${s.w}/${s.l}** — ΔMMR (mo) **${fmtDelta(s.month)}**`)
@@ -69,7 +105,7 @@ async function sendPickDM({ user, header, guild, candidates }) {
 module.exports = async (eventObj, queue) => {
   const channel = eventObj.channel
   const guild   = eventObj.guild
-  const client  = require('../index') // global Discord.Client we logged in with
+  const client  = require('../index') // your Discord.Client from index.js
 
   // normalize
   queue.players = (queue.players || []).filter(Boolean)
@@ -104,13 +140,12 @@ module.exports = async (eventObj, queue) => {
     }
   })
 
-  // Resolve User objects (NOT GuildMember) so we can DM regardless of intents
-  const blueUser   = client.users?.cache?.get?.(blueCap.id)   || await client.users.fetch(blueCap.id).catch(()=>null)
-  const orangeUser = client.users?.cache?.get?.(orangeCap.id) || await client.users.fetch(orangeCap.id).catch(()=>null)
+  // Resolve users via v11-compatible fetch to ensure DMs can be sent
+  const blueUser   = await fetchUserCompat(client, blueCap.id)
+  const orangeUser = await fetchUserCompat(client, orangeCap.id)
 
   if (!blueUser || !orangeUser) {
     await channel.send('Could not DM captains (couldn’t fetch user objects). Ask them to enable DMs or ensure the bot can fetch users.')
-    // Still proceed? Safer to abort to avoid stuck drafts
     queue.draft.currentPicker = null
     return
   }
@@ -143,12 +178,23 @@ module.exports = async (eventObj, queue) => {
       firstCollector.stop('picked')
       resolve(emojiToIndex[r.emoji.name] - 1) // 0-based index
     })
-    firstCollector.on('end', (_, reason) => { if (reason !== 'picked') resolve(null) })
+    firstCollector.on('end', async (_, reason) => {
+      if (reason !== 'picked') resolve(null)
+    })
   })
 
   if (firstResult == null) {
+    // Mark expired & announce loudly in queue channel
     queue.draft.currentPicker = null
-    await channel.send('Draft timed out (first pick). Lobby disbanded.')
+    queue.status = 'expired'
+    queue.expiresAt = new Date().toISOString()
+    await channel.send({
+      embed: {
+        color: 15158332,
+        title: `Lobby ${queue?.lobby?.name || 'Lobby'} — Queue expired`,
+        description: `No pick received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes. The queue has been **disbanded**.`
+      }
+    })
     const { deletePlayerQueue } = require('../utils/managePlayerQueues')
     deletePlayerQueue(queue.lobby.id)
     return
@@ -186,12 +232,22 @@ module.exports = async (eventObj, queue) => {
         resolve()
       }
     })
-    secondCollector.on('end', (_, reason) => { if (reason !== 'picked-two') resolve() })
+    secondCollector.on('end', (_, reason) => {
+      if (reason !== 'picked-two') resolve()
+    })
   })
 
   if (chosen.size < 2) {
     queue.draft.currentPicker = null
-    await channel.send('Draft timed out (second pick). Lobby disbanded.')
+    queue.status = 'expired'
+    queue.expiresAt = new Date().toISOString()
+    await channel.send({
+      embed: {
+        color: 15158332,
+        title: `Lobby ${queue?.lobby?.name || 'Lobby'} — Queue expired`,
+        description: `No picks received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes. The queue has been **disbanded**.`
+      }
+    })
     const { deletePlayerQueue } = require('../utils/managePlayerQueues')
     deletePlayerQueue(queue.lobby.id)
     return
