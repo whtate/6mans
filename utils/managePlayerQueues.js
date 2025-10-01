@@ -17,7 +17,17 @@ const REQUIRED_PLAYERS =
 
 const AUTODISBAND_MS = Number.isFinite(parseInt(process.env.AUTODISBAND_MS, 10))
   ? parseInt(process.env.AUTODISBAND_MS, 10)
-  : (7 * 60 * 1000) // 7 minutes
+  : (0) // disable old pre-fill disband by default when per-player keepalive is used
+
+const KEEPALIVE_MS =
+  Number.isFinite(parseInt(process.env.KEEPALIVE_MS, 10))
+    ? parseInt(process.env.KEEPALIVE_MS, 10)
+    : 60 * 60 * 1000 // 1 hour
+
+const KEEPALIVE_WARN_MS =
+  Number.isFinite(parseInt(process.env.KEEPALIVE_WARN_MS, 10))
+    ? parseInt(process.env.KEEPALIVE_WARN_MS, 10)
+    : 5 * 60 * 1000 // 5 minutes
 
 // ---- per-guild state ----
 const guildStates = new Map()  // key: guildId or '_default'
@@ -79,18 +89,27 @@ function createQueue(guildId) {
     playerIdsIndexed: {},
     ...cloneDeep(queueResetValues),
 
-    activeMatch: null,  // { teamAIds, teamBIds } once teams are formed
+    activeMatch: null,    // { teamAIds, teamBIds } once teams are formed
     createdAt: Date.now(),
+
+    // old queue-level timers (kept for compatibility)
     autoDisbandTimer: null,
+
+    // NEW: per-player keepalive structure
+    keepAlive: {
+      // [userId]: { warnTO, kickTO, untilTs }
+    },
   }
 
-  // Start auto-disband timer (if lobby never fills)
-  queue.autoDisbandTimer = setTimeout(() => {
-    const count = Object.keys(queue.playerIdsIndexed).length
-    if (count < REQUIRED_PLAYERS && !queue.votingInProgress && !queue.activeMatch) {
-      deletePlayerQueue(queue.lobby.id)
-    }
-  }, AUTODISBAND_MS)
+  // (Optional) legacy pre-fill disband (disabled by default)
+  if (AUTODISBAND_MS > 0) {
+    queue.autoDisbandTimer = setTimeout(() => {
+      const count = Object.keys(queue.playerIdsIndexed).length
+      if (count < REQUIRED_PLAYERS && !queue.votingInProgress && !queue.activeMatch) {
+        deletePlayerQueue(queue.lobby.id)
+      }
+    }, AUTODISBAND_MS)
+  }
 
   state.queues.push(queue)
   return queue
@@ -132,6 +151,112 @@ function determinePlayerQueue(playerId, command, guildId) {
   return createQueue(guildId)
 }
 
+// Helper: announce in the queue text channel (best-effort)
+function announceToQueueChannel(queue, text) {
+  try {
+    const client = require('../index')
+    const guild  = client.guilds.get(queue.guildId)
+    const chan   = guild && guild.channels.find(ch => ch.type === 'text' && ch.name === process.env.channelName)
+    if (chan) chan.send(text)
+  } catch (e) {
+    console.error('announceToQueueChannel failed', e)
+  }
+}
+
+// ---- NEW: per-player keepalive management ----
+async function startKeepAlive(queue, userId) {
+  try {
+    if (!queue.keepAlive) queue.keepAlive = {}
+    // clear any existing timers first
+    cancelKeepAlive(queue, userId)
+
+    const client = require('../index')
+    const user = client.users.get(userId)
+    if (!user) return
+
+    const untilTs = Date.now() + KEEPALIVE_MS
+    const warnDelay = Math.max(untilTs - Date.now() - KEEPALIVE_WARN_MS, 0)
+    const kickDelay = Math.max(untilTs - Date.now(), 0)
+
+    // Schedule warning DM
+    const warnTO = setTimeout(async () => {
+      try {
+        const dm = await user.send(
+          `⏳ You’ve been in **${queue.lobby.name}** for almost an hour.\n` +
+          `React with ✅ in the next **${Math.round(KEEPALIVE_WARN_MS/60000)} minutes** to **stay in the queue for another hour**.\n\n` +
+          `If you don’t react, you’ll be removed.`
+        )
+        await dm.react('✅')
+
+        // v11 reaction collector
+        const filter = (reaction, reactor) => reaction.emoji.name === '✅' && reactor.id === userId
+        const collector = dm.createReactionCollector(filter, { time: KEEPALIVE_WARN_MS })
+
+        let extended = false
+        collector.on('collect', () => {
+          extended = true
+          collector.stop('extended')
+        })
+
+        collector.on('end', (collected, reason) => {
+          if (reason === 'extended' && extended) {
+            // player opted to stay: reset for another hour
+            // only if they are STILL in this queue
+            if (queue.playerIdsIndexed[userId]) {
+              // reschedule fresh window
+              cancelKeepAlive(queue, userId)
+              startKeepAlive(queue, userId)
+              user.send('✅ Got it — you’ll **stay in the queue for another hour**.')
+            }
+          }
+        })
+      } catch (e) {
+        console.error('keepalive warn DM failed', e)
+      }
+    }, warnDelay)
+
+    // Schedule kick removal
+    const kickTO = setTimeout(() => {
+      try {
+        // If user is still in this queue AND didn’t extend, remove them
+        if (queue.playerIdsIndexed[userId]) {
+          // remove from queue
+          delete queue.playerIdsIndexed[userId]
+          if (Array.isArray(queue.players)) {
+            queue.players = queue.players.filter(p => p.id !== userId)
+          }
+          announceToQueueChannel(queue, `⌛ <@${userId}> was **removed from the queue** (inactive).`)
+          // DM them
+          user.send(`You were removed from **${queue.lobby.name}** due to inactivity. You can **!q** again anytime.`)
+        }
+      } catch (e) {
+        console.error('keepalive kick failed', e)
+      } finally {
+        cancelKeepAlive(queue, userId)
+      }
+    }, kickDelay)
+
+    queue.keepAlive[userId] = { warnTO, kickTO, untilTs }
+  } catch (e) {
+    console.error('startKeepAlive failed', e)
+  }
+}
+
+function cancelKeepAlive(queue, userId) {
+  if (!queue || !queue.keepAlive || !queue.keepAlive[userId]) return
+  const { warnTO, kickTO } = queue.keepAlive[userId]
+  if (warnTO) clearTimeout(warnTO)
+  if (kickTO) clearTimeout(kickTO)
+  delete queue.keepAlive[userId]
+}
+
+function cancelAllKeepAlive(queue) {
+  if (!queue || !queue.keepAlive) return
+  for (const uid of Object.keys(queue.keepAlive)) {
+    cancelKeepAlive(queue, uid)
+  }
+}
+
 // When teams/VCs are created, call this so players are free to re-queue
 function registerActiveMatch(queue, teamAIds, teamBIds) {
   queue.activeMatch = { teamAIds: [...teamAIds], teamBIds: [...teamBIds] }
@@ -139,16 +264,13 @@ function registerActiveMatch(queue, teamAIds, teamBIds) {
   queue.creatingTeamsInProgress = false
 
   // Cancel auto-disband + vote timers; match is in progress
-  if (queue.autoDisbandTimer) {
-    clearTimeout(queue.autoDisbandTimer)
-    queue.autoDisbandTimer = null
-  }
-  if (queue._voteTimeout) {
-    clearTimeout(queue._voteTimeout)
-    queue._voteTimeout = null
-  }
+  if (queue.autoDisbandTimer) { clearTimeout(queue.autoDisbandTimer); queue.autoDisbandTimer = null }
+  if (queue._voteTimeout)     { clearTimeout(queue._voteTimeout);     queue._voteTimeout = null }
 
-  // Free players from queue (so they can join another queue immediately)
+  // Cancel per-player keepalive while they play
+  cancelAllKeepAlive(queue)
+
+  // Free players from queue (so they can join another queue immediately if they want after)
   const state = getGuildState(queue.guildId)
   for (const id of [...teamAIds, ...teamBIds]) {
     delete queue.playerIdsIndexed[id]
@@ -183,7 +305,8 @@ function deletePlayerQueue(lobbyId) {
     if (idx >= 0) {
       const q = state.queues[idx]
       if (q.autoDisbandTimer) clearTimeout(q.autoDisbandTimer)
-      if (q._voteTimeout) clearTimeout(q._voteTimeout)
+      if (q._voteTimeout)     clearTimeout(q._voteTimeout)
+      cancelAllKeepAlive(q)
       // clear active index
       if (q.activeMatch) {
         for (const id of [...q.activeMatch.teamAIds, ...q.activeMatch.teamBIds]) {
@@ -205,6 +328,7 @@ function resetPlayerQueue(lobbyId) {
 
     if (q.autoDisbandTimer) { clearTimeout(q.autoDisbandTimer); q.autoDisbandTimer = null }
     if (q._voteTimeout)     { clearTimeout(q._voteTimeout);     q._voteTimeout = null }
+    cancelAllKeepAlive(q)
 
     const preserved = {
       guildId: q.guildId,
@@ -216,14 +340,17 @@ function resetPlayerQueue(lobbyId) {
     fresh.players = []
     fresh.playerIdsIndexed = {}
     fresh.activeMatch = null
+    fresh.keepAlive = {}
 
-    // restart the pre-fill auto-disband timer
-    fresh.autoDisbandTimer = setTimeout(() => {
-      const count = Object.keys(fresh.playerIdsIndexed).length
-      if (count < REQUIRED_PLAYERS && !fresh.votingInProgress && !fresh.activeMatch) {
-        deletePlayerQueue(fresh.lobby.id)
-      }
-    }, AUTODISBAND_MS)
+    // optional legacy pre-fill timer
+    if (AUTODISBAND_MS > 0) {
+      fresh.autoDisbandTimer = setTimeout(() => {
+        const count = Object.keys(fresh.playerIdsIndexed).length
+        if (count < REQUIRED_PLAYERS && !fresh.votingInProgress && !fresh.activeMatch) {
+          deletePlayerQueue(fresh.lobby.id)
+        }
+      }, AUTODISBAND_MS)
+    }
 
     state.queues[idx] = fresh
     return
@@ -236,10 +363,11 @@ function kickPlayer(playerIndex, queue, messageChannel) {
   const playerId = playerObj.id
   delete queue.playerIdsIndexed[playerId]
   queue.players.splice(playerIndex, 1)
+  cancelKeepAlive(queue, playerId)
   if (messageChannel) {
     messageChannel(`<@${playerId}> has been kicked. You can check the lobby status with ${commandToString.status}`)
   }
-  resetPlayerQueue(queue.lobby.id)
+  // do not reset whole lobby; keep others
 }
 
 function removeOfflinePlayerFromQueue({ playerId, playerChannels, guildId }) {
@@ -253,6 +381,7 @@ function removeOfflinePlayerFromQueue({ playerId, playerChannels, guildId }) {
 
   playersQueue.players = playersQueue.players.filter(p => p.id !== playerId)
   delete playersQueue.playerIdsIndexed[playerId]
+  cancelKeepAlive(playersQueue, playerId)
 
   const channel = playerChannels.find(ch => ch.name === process.env.channelName)
 
@@ -304,4 +433,10 @@ module.exports = {
 
   // Optional helpers
   listQueues,
+
+  // Keepalive exports
+  startKeepAlive,
+  cancelKeepAlive,
+  cancelAllKeepAlive,
+  announceToQueueChannel,
 }
