@@ -23,7 +23,7 @@ const {
   registerRemakeVote,
   requiredRemakeVotes,
   resetPlayerQueue,
-  listQueues, // used to show status even if user isn't in a queue
+  listQueues,
 } = require('../utils/managePlayerQueues')
 
 // Commands map
@@ -61,21 +61,6 @@ function getTeamIdsFromQueue(queue) {
   return { ok: false }
 }
 
-function fmtUser(id, username) {
-  const isSnowflake = /^\d+$/.test(id)
-  return isSnowflake ? `<@${id}>${username ? ` (${username})` : ''}` : (username || String(id))
-}
-
-function fmtTeam(list) {
-  return list.map(u => `- ${fmtUser(u, null)}`).join('\n')
-}
-
-/**
- * Delete team voice channels for the given queue.
- * Version-agnostic for discord.js v11–v14:
- * - v11: guild.channels.get(id)
- * - v12+: guild.channels.cache.get(id)
- */
 async function deleteTeamVoiceChannels(queue, guild) {
   try {
     const ids = [
@@ -86,8 +71,8 @@ async function deleteTeamVoiceChannels(queue, guild) {
     for (const id of ids) {
       let ch = null
       try {
-        if (!ch && guild?.channels?.cache?.get) ch = guild.channels.cache.get(id)   // v12+
-        if (!ch && guild?.channels?.get)        ch = guild.channels.get(id)        // v11
+        if (!ch && guild?.channels?.cache?.get) ch = guild.channels.cache.get(id)
+        if (!ch && guild?.channels?.get)        ch = guild.channels.get(id)
       } catch (e) {}
 
       if (!ch || typeof ch.delete !== 'function') continue
@@ -112,6 +97,7 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
   const authorId = eventObj.author.id
   const guildId = eventObj.guild?.id
   const channel = eventObj.channel
+  const guild = eventObj.guild
 
   const commonLogCheck = debugLogs === 'true' && authorId !== botUser.id
 
@@ -140,7 +126,7 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
   const command = rawCommand
   const playerId = eventObj.author.id
 
-  // NEW: proactively upsert author's username (and any mentioned users) so we don't store numeric IDs as usernames
+  // Proactively capture/refresh usernames (author + mentions)
   try {
     await upsertPlayer({
       guildId,
@@ -148,35 +134,26 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       username: eventObj.author.username
     })
     eventObj.mentions?.users?.forEach?.(u => {
-      upsertPlayer({
-        guildId,
-        userId: u.id,
-        username: u.username
-      }).catch(()=>{})
+      upsertPlayer({ guildId, userId: u.id, username: u.username }).catch(()=>{})
     })
   } catch (e) {
     console.error('upsertPlayer (author/mentions) failed', e?.message || e)
   }
 
-  // Place user into a queue for join-related commands; else we may use active-match lookup.
+  // Determine queue for join-like commands
   let queue = determinePlayerQueue(playerId, command, guildId)
 
-  // Commands that do NOT require queue membership
   const nonQueueCommands = new Set([
     commandToString.stats,
-    '!leaderboard', commandToString.leaderboard, // both accepted
+    '!leaderboard', commandToString.leaderboard,
     commandToString.help,
     commandToString.report,
     commandToString.lobbyhistory, '!lh', '!lobby', '!lobby-history',
     commandToString.playerhistory,
     commandToString.lastmatch, '!lastmatch', '!last-match',
     commandToString.remake,
-
-    // Allow status and votestatus regardless of membership
     commandToString.status,
     commandToString.votestatus,
-
-    // Allow kick to pass through so admin override can work
     commandToString.kick,
   ])
 
@@ -185,14 +162,11 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
     return
   }
 
-  // Helper: if user isn't in a queue, pick most recent lobby to show status/votestatus
   const resolveQueueForView = () => {
     if (queue) return queue
     const qs = listQueues(guildId) || []
     return qs.length ? qs[qs.length - 1] : null
   }
-
-  // ------------- switch -------------
 
   switch (command) {
     // queue flow
@@ -247,48 +221,47 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       )
     }
 
-    // leaderboard (MMR-ordered, with exclusions and variable size)
+    // ---------- LEADERBOARD (code block, resolve numeric usernames to names if possible) ----------
     case commandToString.leaderboard:
     case '!leaderboard': {
-      // Usage: !lb, !lb 50, !lb all
       const arg = (rest[0] || '').trim();
       let limit = 10;
       if (/^all$/i.test(arg)) {
-        limit = null; // fetch all
+        limit = null;
       } else if (/^\d+$/.test(arg)) {
         limit = Math.min(parseInt(arg, 10), 2000);
       }
 
-      // Exclusion lists (IDs and optional usernames)
       const excludeUserIds = (process.env.LEADERBOARD_EXCLUDE_USER_IDS || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-
+        .split(',').map(s => s.trim()).filter(Boolean)
       const excludeUsernames = (process.env.LEADERBOARD_EXCLUDE_USERNAMES || '')
-        .split(',')
-        .map(s => s.trim())
-        .filter(Boolean);
-
+        .split(',').map(s => s.trim()).filter(Boolean)
       const minGames = Number.isFinite(parseInt(process.env.LEADERBOARD_MIN_GAMES, 10))
-        ? parseInt(process.env.LEADERBOARD_MIN_GAMES, 10)
-        : 0;
+        ? parseInt(process.env.LEADERBOARD_MIN_GAMES, 10) : 0
 
-      const rows = await getLeaderboard({ guildId, limit, excludeUserIds, excludeUsernames, minGames });
-      if (!rows.length) return channel.send('No players found.');
+      const rows = await getLeaderboard({ guildId, limit, excludeUserIds, excludeUsernames, minGames })
+      if (!rows.length) return channel.send('No players found.')
 
-      const header = `**Leaderboard by MMR (${limit ? `Top ${rows.length}` : `All ${rows.length}`})**\n\`\`\`\n#  NAME                 W   L   MMR  ΔMMR\n----------------------------------------------`;
+      const header =
+        `**Leaderboard by MMR (${limit ? `Top ${rows.length}` : `All ${rows.length}`})**\n` +
+        '```' + '\n' +
+        '#  NAME                 W   L   MMR  ΔMMR\n' +
+        '----------------------------------------------'
       const lines = rows.map((r, i) => {
-        const rank = String(i + 1).padStart(2, ' ');
-        const nameValue = (/^\d{16,}$/.test(r.username || '') ? `<@${r.user_id}>` : r.username);
-        const name = String(nameValue).padEnd(20, ' ');
-        const w    = String(r.month_wins || 0).padStart(3, ' ');
-        const l    = String(r.month_losses || 0).padStart(3, ' ');
-        const mmr  = String(r.lifetime_mmr || 0).padStart(4, ' ');
-        const d    = String((r.month_mmr_delta || 0)).padStart(5, ' ');
-        return `${rank} ${name} ${w} ${l} ${mmr} ${d}`;
-      });
-      return channel.send([header, ...lines, '```'].join('\n'));
+        let display = r.username
+        if (/^\d{16,}$/.test(display || '')) {
+          const mem = guild?.members?.cache?.get?.(r.user_id)
+          display = mem?.user?.username || r.user_id
+        }
+        const rank = String(i + 1).padStart(2, ' ')
+        const name = String(display).padEnd(20, ' ')
+        const w    = String(r.month_wins || 0).padStart(3, ' ')
+        const l    = String(r.month_losses || 0).padStart(3, ' ')
+        const mmr  = String(r.lifetime_mmr || 0).padStart(4, ' ')
+        const d    = String((r.month_mmr_delta || 0)).padStart(5, ' ')
+        return `${rank} ${name} ${w} ${l} ${mmr} ${d}`
+      })
+      return channel.send([header, ...lines, '```'].join('\n'))
     }
 
     // report (still !report a|b)
@@ -324,7 +297,6 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
           lobbySeries: queue?.lobby?.series || null,
         })
 
-        // Delete team voice channels now that match is finished
         await deleteTeamVoiceChannels(queue, eventObj.guild)
 
         clearActiveMatch(queue)
@@ -360,9 +332,7 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       if (!counted) return channel.send(`You already voted to remake. Current votes: **${total}/${need}**.`)
 
       if (total >= need) {
-        // Delete team voice channels on remake
         await deleteTeamVoiceChannels(queue, eventObj.guild)
-
         clearActiveMatch(queue)
         resetPlayerQueue(queue.lobby.id)
         return channel.send(`**Remake passed.** Lobby reset. Players can queue again now.`)
@@ -375,12 +345,10 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
     case '!lh':
     case '!lobby':
     case '!lobby-history': {
-      // If an argument is a number, treat it as "Lobby #N" with brand
-      const rawArg = msg.slice(command.length).trim() // preserve case & spaces
+      const rawArg = msg.slice(command.length).trim()
       let name = rawArg || ''
 
       if (!name) {
-        // Auto: use current queue's lobby name if available; else use most recent match's lobby
         if (queue?.lobby?.name) {
           name = queue.lobby.name
         } else {
@@ -388,12 +356,10 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
           if (latest.length && latest[0].lobby_name) {
             name = latest[0].lobby_name
           } else {
-            // fallback: no filter (will show recent across all lobbies)
             name = ''
           }
         }
       } else {
-        // Normalize numbers → "Brand — Lobby #N"
         const num = name.match(/^\s*(\d+)\s*$/)?.[1]
         if (num) name = `${BRAND} — Lobby #${num}`
       }
