@@ -86,16 +86,13 @@ async function deleteTeamVoiceChannels(queue, guild) {
     for (const id of ids) {
       let ch = null
       try {
-        // v12+ path
-        if (!ch && guild?.channels?.cache?.get) ch = guild.channels.cache.get(id)
-        // v11 path
-        if (!ch && guild?.channels?.get) ch = guild.channels.get(id)
-      } catch (e) {
-        // ignore lookup failures per-channel
-      }
+        if (!ch && guild?.channels?.cache?.get) ch = guild.channels.cache.get(id)   // v12+
+        if (!ch && guild?.channels?.get)        ch = guild.channels.get(id)        // v11
+      } catch (e) {}
+
       if (!ch || typeof ch.delete !== 'function') continue
       try {
-        await ch.delete('6mans: match reported, cleaning up team voice channels')
+        await ch.delete('6mans: match completed / remade — cleaning up team voice channels')
       } catch (e) {
         console.error('Failed to delete voice channel', id, e && e.message)
       }
@@ -212,7 +209,6 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       break
 
     case commandToString.kick:
-      // Now permitted even if not in queue; admin override handled inside action
       kickPlayer(eventObj, queue || resolveQueueForView() || { players: [], playerIdsIndexed: {}, lobby: { name: 'Lobby' } })
       break
 
@@ -233,20 +229,46 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       )
     }
 
-    // leaderboard
+    // leaderboard (MMR-ordered, with exclusions and variable size)
     case commandToString.leaderboard:
     case '!leaderboard': {
-      const rows = await getLeaderboard({ guildId, limit: 10 })
-      if (!rows.length) return channel.send('No games recorded yet.')
-      const header = `**Monthly Leaderboard (Top ${rows.length})**\n\`\`\`\n#  W   L  ΔMMR  NAME\n-----------------------------`
+      // Usage: !lb, !lb 50, !lb all
+      const arg = (rest[0] || '').trim();
+      let limit = 10;
+      if (/^all$/i.test(arg)) {
+        limit = null; // fetch all
+      } else if (/^\d+$/.test(arg)) {
+        limit = Math.min(parseInt(arg, 10), 2000);
+      }
+
+      // Exclusion lists (IDs and optional usernames)
+      const excludeUserIds = (process.env.LEADERBOARD_EXCLUDE_USER_IDS || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+      const excludeUsernames = (process.env.LEADERBOARD_EXCLUDE_USERNAMES || '')
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
+
+      const minGames = Number.isFinite(parseInt(process.env.LEADERBOARD_MIN_GAMES, 10))
+        ? parseInt(process.env.LEADERBOARD_MIN_GAMES, 10)
+        : 0;
+
+      const rows = await getLeaderboard({ guildId, limit, excludeUserIds, excludeUsernames, minGames });
+      if (!rows.length) return channel.send('No players found.');
+
+      const header = `**Leaderboard by MMR (${limit ? `Top ${rows.length}` : `All ${rows.length}`})**\n\`\`\`\n#   MMR   W   L  ΔMMR  NAME\n---------------------------------------`;
       const lines = rows.map((r, i) => {
-        const rank = String(i + 1).padStart(2, ' ')
-        const w    = String(r.month_wins || 0).padStart(3, ' ')
-        const l    = String(r.month_losses || 0).padStart(3, ' ')
-        const d    = String((r.month_mmr_delta || 0)).padStart(5, ' ')
-        return `${rank} ${w} ${l} ${d}  ${r.username}`
-      })
-      return channel.send([header, ...lines, '```'].join('\n'))
+        const rank = String(i + 1).padStart(2, ' ');
+        const mmr  = String(r.lifetime_mmr || 0).padStart(4, ' ');
+        const w    = String(r.month_wins || 0).padStart(3, ' ');
+        const l    = String(r.month_losses || 0).padStart(3, ' ');
+        const d    = String((r.month_mmr_delta || 0)).padStart(5, ' ');
+        return `${rank} ${mmr} ${w} ${l} ${d}  ${r.username}`;
+      });
+      return channel.send([header, ...lines, '```'].join('\n'));
     }
 
     // report (still !report a|b)
@@ -318,6 +340,9 @@ module.exports = async (eventObj, botUser = { id: undefined }) => {
       if (!counted) return channel.send(`You already voted to remake. Current votes: **${total}/${need}**.`)
 
       if (total >= need) {
+        // Delete team voice channels on remake
+        await deleteTeamVoiceChannels(queue, eventObj.guild)
+
         clearActiveMatch(queue)
         resetPlayerQueue(queue.lobby.id)
         return channel.send(`**Remake passed.** Lobby reset. Players can queue again now.`)

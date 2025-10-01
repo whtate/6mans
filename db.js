@@ -332,17 +332,39 @@ async function getLastMatches({ guildId, limit = 5 }) {
   return rows;
 }
 
-// ---------- NEW: Leaderboard (order by lifetime MMR w/ exclusions) ----------
+// ---------- Leaderboard (order by lifetime MMR; exclusions; min games) ----------
 
-async function getLeaderboard({ guildId, limit = 10, excludeUserIds = [] }) {
-  let extraWhere = '';
+async function getLeaderboard({
+  guildId,
+  limit = 10,
+  excludeUserIds = [],
+  excludeUsernames = [],
+  minGames = 0, // hide accounts with fewer than N total recorded games
+}) {
   const params = [guildId];
+  const whereParts = ['p.guild_id = $1'];
 
+  // Exclude by user IDs (exact match)
   if (excludeUserIds && excludeUserIds.length) {
     params.push(excludeUserIds);
-    extraWhere += ` AND p.user_id <> ALL($${params.length})`;
+    whereParts.push(`NOT (p.user_id = ANY($${params.length}::text[]))`);
   }
 
+  // Exclude by usernames (case-insensitive)
+  if (excludeUsernames && excludeUsernames.length) {
+    const lowered = excludeUsernames.map(s => s.toLowerCase());
+    params.push(lowered);
+    whereParts.push(`NOT (LOWER(p.username) = ANY($${params.length}::text[]))`);
+  }
+
+  // Minimum total games (wins + losses, from history)
+  let havingClause = '';
+  if (Number.isFinite(minGames) && minGames > 0) {
+    params.push(minGames);
+    havingClause = `HAVING COALESCE(SUM(CASE WHEN h.win IS NOT NULL THEN 1 ELSE 0 END),0) >= $${params.length}`;
+  }
+
+  // Optional LIMIT
   let limitClause = '';
   if (Number.isFinite(limit) && limit > 0) {
     params.push(limit);
@@ -356,28 +378,41 @@ async function getLeaderboard({ guildId, limit = 10, excludeUserIds = [] }) {
              SUM(CASE WHEN win THEN 0 ELSE 1 END)::int AS losses,
              SUM(delta)::int AS mmr_delta
       FROM mmr_history
-      WHERE guild_id=$1
+      WHERE guild_id = $1
         AND created_at >= date_trunc('month', now())
       GROUP BY user_id
     )
+    , total_games AS (
+      SELECT p.user_id,
+             COALESCE(SUM(CASE WHEN h.win IS NOT NULL THEN 1 ELSE 0 END),0)::int AS games
+      FROM players p
+      LEFT JOIN mmr_history h
+        ON h.guild_id = p.guild_id AND h.user_id = p.user_id
+      WHERE ${whereParts.join(' AND ')}
+      GROUP BY p.user_id
+      ${havingClause}
+    )
     SELECT p.username,
            p.user_id,
-           COALESCE(ms.wins,0)   AS month_wins,
-           COALESCE(ms.losses,0) AS month_losses,
-           COALESCE(ms.mmr_delta,0) AS month_mmr_delta,
-           p.mmr AS lifetime_mmr
+           COALESCE(ms.wins,0)          AS month_wins,
+           COALESCE(ms.losses,0)        AS month_losses,
+           COALESCE(ms.mmr_delta,0)     AS month_mmr_delta,
+           p.mmr                        AS lifetime_mmr,
+           COALESCE(tg.games, 0)        AS total_games
     FROM players p
     LEFT JOIN month_stats ms ON ms.user_id = p.user_id
-    WHERE p.guild_id=$1
-    ${extraWhere}
+    LEFT JOIN total_games tg ON tg.user_id = p.user_id
+    WHERE ${whereParts.join(' AND ')}
     ORDER BY p.mmr DESC, p.username ASC
     ${limitClause};
   `;
+
   const { rows } = await pool.query(sql, params);
-  return rows;
+  // If minGames was set, rows already filtered by CTE; otherwise tg may be null
+  return rows.filter(r => r.total_games !== null);
 }
 
-// ---------- OPTIONAL: Sub penalty helper (kept here, configurable via env) ----------
+// ---------- OPTIONAL: Sub penalty helper (configurable via env) ----------
 
 async function applySubPenalty({ guildId, subOutUserId, amount = null, matchId = null }) {
   const penalty = Number.isFinite(parseInt(process.env.SUB_PENALTY_MMR, 10))
@@ -402,7 +437,7 @@ async function applySubPenalty({ guildId, subOutUserId, amount = null, matchId =
       [penalty, guildId, subOutUserId]
     );
 
-    // optional: keep a row in mmr_history with matchId=null and win=false
+    // optional: keep a row in mmr_history with matchId=0 to document penalty
     await client.query(
       `INSERT INTO mmr_history (guild_id, user_id, match_id, win, delta)
        VALUES ($1,$2,$3,$4,$5)`,
