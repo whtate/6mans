@@ -71,6 +71,7 @@ const queueResetValues = {
 
   // runtime-only handles
   _voteTimeout: null,
+  _draftTimeout: null,   // <— ensure present
 }
 
 function queueLabel(prefix, number) {
@@ -242,6 +243,7 @@ function registerActiveMatch(queue, teamAIds, teamBIds) {
 
   if (queue.autoDisbandTimer) { clearTimeout(queue.autoDisbandTimer); queue.autoDisbandTimer = null }
   if (queue._voteTimeout)     { clearTimeout(queue._voteTimeout);     queue._voteTimeout = null }
+  if (queue._draftTimeout)    { clearTimeout(queue._draftTimeout);    queue._draftTimeout = null }  // <— clear draft timer
   cancelAllKeepAlive(queue)
 
   const state = getGuildState(queue.guildId)
@@ -274,6 +276,7 @@ function deletePlayerQueue(lobbyId) {
       const q = state.queues[idx]
       if (q.autoDisbandTimer) clearTimeout(q.autoDisbandTimer)
       if (q._voteTimeout)     clearTimeout(q._voteTimeout)
+      if (q._draftTimeout)    clearTimeout(q._draftTimeout)   // <— clear draft timer
       cancelAllKeepAlive(q)
       if (q.activeMatch) {
         for (const id of [...q.activeMatch.teamAIds, ...q.activeMatch.teamBIds]) {
@@ -294,6 +297,7 @@ function resetPlayerQueue(lobbyId) {
 
     if (q.autoDisbandTimer) { clearTimeout(q.autoDisbandTimer); q.autoDisbandTimer = null }
     if (q._voteTimeout)     { clearTimeout(q._voteTimeout);     q._voteTimeout = null }
+    if (q._draftTimeout)    { clearTimeout(q._draftTimeout);    q._draftTimeout = null } // <— clear draft timer
     cancelAllKeepAlive(q)
 
     const preserved = {

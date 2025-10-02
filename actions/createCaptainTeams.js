@@ -1,18 +1,48 @@
 // actions/createCaptainTeams.js
-// v11-friendly DM draft:
-// - Resolve captains via guild.members.get/fetchMember → member.user.createDM()
-// - Reaction-based selection in DMs using 1️⃣ 2️⃣ 3️⃣ 4️⃣
-// - Loud 7-min timeout that expires the queue and deletes it
-// - Creates voice channels after teams are ready
+// v11-compatible captain draft:
+// - Announces captains in the queue channel
+// - DMs captains a scouting card (MMR, lifetime W/L, month ΔMMR)
+// - Captains pick by reacting in DM (1️⃣..4️⃣)
+// - 7-minute timeout per pick; expired queue is announced + deleted
+// - Creates voice channels after teams finalize
 
 const { getStats, upsertPlayer } = require('../db')
 const createVoiceChannels = require('./createVoiceChannels')
 
-const PICK_TIMEOUT_MS = 7 * 60 * 1000
+const PICK_TIMEOUT_MS =
+  Number.isFinite(parseInt(process.env.PICK_TIMEOUT_MS, 10))
+    ? parseInt(process.env.PICK_TIMEOUT_MS, 10)
+    : 7 * 60 * 1000
+
 const NUM_EMOJI = ['1️⃣', '2️⃣', '3️⃣', '4️⃣']
 
 function randInt(n) { return Math.floor(Math.random() * n) }
 function fmtDelta(n) { const v = Number(n) || 0; return `${v >= 0 ? '+' : ''}${v}` }
+
+function clearDraftTimeout(queue) {
+  if (queue && queue._draftTimeout) {
+    clearTimeout(queue._draftTimeout)
+    queue._draftTimeout = null
+  }
+}
+
+function expireQueue(queue, channel, msg) {
+  try {
+    if (queue?.draft) queue.draft.currentPicker = null
+    queue.status = 'expired'
+    queue.expiresAt = new Date().toISOString()
+  } catch (_) {}
+  clearDraftTimeout(queue)
+  channel.send({
+    embed: {
+      color: 15158332,
+      title: `Lobby ${queue?.lobby?.name || 'Lobby'} — Queue expired`,
+      description: msg || 'No picks received in time. The queue has been **disbanded**.'
+    }
+  })
+  const { deletePlayerQueue } = require('../utils/managePlayerQueues')
+  deletePlayerQueue(queue.lobby.id)
+}
 
 async function statsLine(guildId, userId, fallbackName) {
   let mmr = 1000, w = 0, l = 0, month = 0
@@ -33,17 +63,12 @@ async function buildScoutingCard(guild, candidates) {
   const lines = []
   for (let i = 0; i < candidates.length; i++) {
     const p = candidates[i]
-    // Resolve username via guild members (v11)
-    let uname = p.username || null
+    // Resolve username via v11 members cache/fetchMember
     let mem = guild.members.get(p.id)
     if (!mem && guild.fetchMember) {
       try { mem = await guild.fetchMember(p.id) } catch (_) {}
     }
-    if (mem && mem.user) {
-      uname = mem.user.username || uname || String(p.id)
-    } else {
-      uname = uname || String(p.id)
-    }
+    const uname = mem?.user?.username || p.username || String(p.id)
     try { await upsertPlayer({ guildId, userId: p.id, username: uname }) } catch {}
     const s = await statsLine(guildId, p.id, uname)
     lines.push(`**${i + 1}.** <@${p.id}> — MMR **${s.mmr}** — W/L **${s.w}/${s.l}** — ΔMMR (mo) **${fmtDelta(s.month)}**`)
@@ -63,38 +88,19 @@ async function sendPickDM({ member, header, guild, candidates }) {
       : `React with the number within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
 
   const msg = await dm.send(body)
-
-  // react with available indices
   for (let i = 0; i < Math.min(candidates.length, NUM_EMOJI.length); i++) {
+    // v11: Message.react returns a promise
     // eslint-disable-next-line no-await-in-loop
     await msg.react(NUM_EMOJI[i])
   }
-
   return msg
-}
-
-function expireQueue(queue, channel, reasonText) {
-  try {
-    queue.draft && (queue.draft.currentPicker = null)
-    queue.status = 'expired'
-    queue.expiresAt = new Date().toISOString()
-  } catch (_) {}
-  channel.send({
-    embed: {
-      color: 15158332,
-      title: `Lobby ${queue?.lobby?.name || 'Lobby'} — Queue expired`,
-      description: reasonText || 'No picks received in time. The queue has been **disbanded**.'
-    }
-  })
-  const { deletePlayerQueue } = require('../utils/managePlayerQueues')
-  deletePlayerQueue(queue.lobby.id)
 }
 
 module.exports = async (eventObj, queue) => {
   const channel = eventObj.channel
   const guild   = eventObj.guild
 
-  // normalize
+  // normalize queue shape
   queue.players = (queue.players || []).filter(Boolean)
   queue.teams   = queue.teams || { blue: { players: [] }, orange: { players: [] } }
 
@@ -116,10 +122,12 @@ module.exports = async (eventObj, queue) => {
     unpicked: pool.map(p => p.id)
   }
 
+  // Announce captains in the queue channel
   await channel.send({
     embed: {
       color: 2201331,
       title: 'Captain structure',
+      description: 'The vote resulted in captains. The following are your captains:',
       fields: [
         { name: 'Captain Blue', value: `<@${blueCap.id}>`, inline: true },
         { name: 'Captain Orange', value: `<@${orangeCap.id}>`, inline: true },
@@ -139,16 +147,25 @@ module.exports = async (eventObj, queue) => {
 
   if (!blueMem || !orangeMem) {
     await channel.send('Could not DM captains (couldn’t resolve guild members). Ask them to enable DMs / check bot permissions.')
-    expireQueue(queue, channel, 'Captains could not be contacted via DM.')
-    return
+    return expireQueue(queue, channel, 'Captains could not be contacted via DM.')
   }
 
-  // randomize who picks first
+  // choose pick order
   const first = Math.random() < 0.5 ? 'blue' : 'orange'
   const second = first === 'blue' ? 'orange' : 'blue'
   queue.draft.currentPicker = first
 
   const emojiToIndex = Object.fromEntries(NUM_EMOJI.map((e, i) => [e, i + 1]))
+
+  // helper: set a single queue._draftTimeout for the current step
+  const armTimeout = (reason) => {
+    clearDraftTimeout(queue)
+    queue._draftTimeout = setTimeout(() => {
+      // If queue was reset/remade, draft.currentPicker may be null; prevent stale timeout from firing.
+      if (!queue || queue.draft?.currentPicker == null) return
+      expireQueue(queue, channel, `${reason} within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
+    }, PICK_TIMEOUT_MS)
+  }
 
   // ---------- FIRST PICK (1) via DM ----------
   let firstMsg
@@ -161,10 +178,10 @@ module.exports = async (eventObj, queue) => {
     })
   } catch (e) {
     await channel.send(`I couldn’t DM the captain for the first pick. Make sure DMs are enabled.`)
-    expireQueue(queue, channel, 'First pick could not be completed.')
-    return
+    return expireQueue(queue, channel, 'First pick could not be completed.')
   }
 
+  armTimeout('No pick received')
   const firstCollector = firstMsg.createReactionCollector(
     (r, u) => u.id === (first === 'blue' ? blueMem.id : orangeMem.id) &&
               emojiToIndex[r.emoji.name] &&
@@ -174,8 +191,9 @@ module.exports = async (eventObj, queue) => {
 
   const firstResult = await new Promise((resolve) => {
     firstCollector.on('collect', (r) => {
+      clearDraftTimeout(queue)
       firstCollector.stop('picked')
-      resolve(emojiToIndex[r.emoji.name] - 1) // 0-based index
+      resolve(emojiToIndex[r.emoji.name] - 1)
     })
     firstCollector.on('end', (_, reason) => {
       if (reason !== 'picked') resolve(null)
@@ -183,8 +201,7 @@ module.exports = async (eventObj, queue) => {
   })
 
   if (firstResult == null) {
-    expireQueue(queue, channel, `No pick received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
-    return
+    return expireQueue(queue, channel, `No pick received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
   }
 
   const firstPickPlayer = pool.splice(firstResult, 1)[0]
@@ -203,10 +220,10 @@ module.exports = async (eventObj, queue) => {
     })
   } catch (e) {
     await channel.send(`I couldn’t DM the captain for the second pick. Make sure DMs are enabled.`)
-    expireQueue(queue, channel, 'Second pick could not be completed.')
-    return
+    return expireQueue(queue, channel, 'Second pick could not be completed.')
   }
 
+  armTimeout('No picks received')
   const chosen = new Set()
   const secondCollector = secondMsg.createReactionCollector(
     (r, u) => u.id === (second === 'blue' ? blueMem.id : orangeMem.id) &&
@@ -221,6 +238,7 @@ module.exports = async (eventObj, queue) => {
       if (!idx1b || idx1b > pool.length) return
       chosen.add(idx1b - 1)
       if (chosen.size >= 2) {
+        clearDraftTimeout(queue)
         secondCollector.stop('picked-two')
         resolve()
       }
@@ -231,8 +249,7 @@ module.exports = async (eventObj, queue) => {
   })
 
   if (chosen.size < 2) {
-    expireQueue(queue, channel, `No picks received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
-    return
+    return expireQueue(queue, channel, `No picks received within ${Math.floor(PICK_TIMEOUT_MS/60000)} minutes.`)
   }
 
   const indices = [...chosen].sort((a, b) => b - a)
@@ -247,6 +264,7 @@ module.exports = async (eventObj, queue) => {
   }
 
   queue.draft.currentPicker = null
+  clearDraftTimeout(queue)
 
   // Publish teams
   await channel.send({
